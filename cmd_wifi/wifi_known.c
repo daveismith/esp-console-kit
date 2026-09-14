@@ -311,27 +311,41 @@ static void on_disconnected(const wifi_event_sta_disconnected_t *ev)
             return;
         }
         const bool auth = is_auth_failure(ev->reason);
+        /*
+         * A passphrase just typed that fails authentication is wrong: stop, and store
+         * nothing -- retrying only fails again, and some access points lock a client out for
+         * it. A stored passphrase that has worked before is not so easily condemned: an access
+         * point still holding the association from before a quick reset answers the rejoin
+         * with AUTH_FAIL (reason 202), and giving up on that left the board offline until the
+         * next reboot. Those are retried like any other failure.
+         */
+        const bool give_up = auth && s_join_commit;
         char ssid[SSID_LEN];
         strlcpy(ssid, s_join_ssid, sizeof(ssid));
         s_joining = false;
-        if (auth) {
-            /* Retrying a wrong passphrase only fails again, and some access points lock a
-             * client out for it. Nothing is stored; see the note at the top. */
+        if (give_up) {
             s_want_connected = false;
-        } else if (s_join_commit) {
+        } else if (!auth && s_join_commit) {
             known_put(ssid, s_join_pass, true);
         }
         s_join_commit = false;
         memset(s_join_pass, 0, sizeof(s_join_pass));
+        bool retry_now = false;
+        if (s_want_connected && s_retries < CONFIG_CMD_WIFI_KNOWN_FAST_RETRIES) {
+            s_retries++;
+            retry_now = true;
+        }
         const bool keep_trying = s_want_connected;
         s_join_result = auth ? RESULT_AUTH_FAILED : RESULT_FAILED;
         unlock();
 
-        ESP_LOGW(TAG, "join %s failed, reason %d%s", ssid, (int)ev->reason,
-                 auth ? " (authentication)" : "");
+        ESP_LOGW(TAG, "join %s failed, reason %d%s%s", ssid, (int)ev->reason,
+                 auth ? " (authentication)" : "", keep_trying ? "; retrying" : "");
         emit(auth ? WIFI_KNOWN_EVT_AUTH_FAILED : WIFI_KNOWN_EVT_JOIN_FAILED, ssid,
              ev->reason, keep_trying);
-        if (keep_trying) {
+        if (retry_now) {
+            esp_wifi_connect();
+        } else if (keep_trying) {
             schedule_retry();
         }
         return;
