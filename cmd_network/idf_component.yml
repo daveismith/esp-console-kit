@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Console commands: ip addr, ping, iperf, traceroute, dig"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"

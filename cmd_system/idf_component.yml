@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Console commands: version, restart, free, heap, membench, flash-stats, tasks, top, log_level, gpio, deep_sleep, light_sleep"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"

@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Console commands: nvs_set, nvs_get, nvs_erase, nvs_erase_namespace, nvs_namespace, nvs_list"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"

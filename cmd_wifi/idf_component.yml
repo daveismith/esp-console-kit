@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Console commands: join, wifi_txpower, wifi_link, wifi_ps, and saved networks (wifi, wifi_save, wifi_forget, wifi_known) with reconnect and rejoin at boot"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"

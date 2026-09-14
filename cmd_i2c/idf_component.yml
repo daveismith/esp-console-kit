@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Console commands: i2cconfig, i2cdetect, i2cget, i2cset, i2cdump -- attaching to the application's existing I2C master bus"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"

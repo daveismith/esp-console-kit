@@ -1,0 +1,26 @@
+menu "Console WiFi commands (cmd_wifi)"
+    depends on ESP_WIFI_ENABLED || ESP_HOST_WIFI_ENABLED
+
+    config CMD_WIFI_KNOWN_NVS_NAMESPACE
+        string "NVS namespace for saved networks"
+        default "wifi_known"
+        help
+            NVS namespace holding the saved-network blob (key "known"). At most 15
+            characters. r2_domeplayer's store used "r2net"; the blob layout is the same,
+            so setting this to "r2net" keeps a board's saved networks across the switch.
+
+    config CMD_WIFI_KNOWN_FAST_RETRIES
+        int "Immediate reconnect attempts after the link drops"
+        default 5
+        range 0 50
+
+    config CMD_WIFI_KNOWN_RETRY_INTERVAL_S
+        int "Seconds between slow reconnect attempts (0 = stop after the immediate ones)"
+        default 30
+        range 0 3600
+        help
+            Once the immediate attempts are used up -- or a join fails for a reason other
+            than authentication -- one reconnect is tried every this many seconds while
+            WiFi is on, so the board recovers by itself when its access point returns.
+
+endmenu
