@@ -652,7 +652,13 @@ static bool route_on_wifi(void)
 /* The link, and which interface carries the default route and whose DNS server answers. */
 static void print_wifi_state(void)
 {
-    printf("wifi: %s\n", s_want_connected ? "on" : "off, until `wifi on` or a reboot");
+    lock();
+    known_load();
+    const bool any_saved = s_known.count > 0;
+    unlock();
+    printf("wifi: %s\n", s_want_connected ? "on"
+                         : any_saved ? "off, until `wifi on` or a reboot"
+                         : "idle, no saved network (`wifi_save <ssid> [pass]`)");
     /* Only ask the driver about the access point with the station up: disconnected, the
      * question itself logs a warning. */
     wifi_ap_record_t ap;
