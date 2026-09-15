@@ -50,6 +50,7 @@ typedef struct {
     unsigned retries;            /* blocks resent or NAKed */
     unsigned timeouts;           /* receive: blocks whose body did not arrive in time */
     unsigned bad_blocks;         /* receive: block-number complement or CRC mismatches */
+    unsigned skipped;            /* receive: stray bytes skipped where a header belonged */
     /* receive, the first bad block: how much of it arrived, its first bytes, and the CRCs */
     size_t diag_len;
     uint8_t diag_head[8];

@@ -10,8 +10,8 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_network` | `register_network_commands()` | `ip addr` `ping` `iperf` `traceroute` `dig` |
 | `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
-| `cmd_fs` | `register_fs(&cfg)` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K |
-| `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` |
+| `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots) and `ota put` (a new image over XMODEM-1K) |
+| `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 
 Notes:
@@ -38,6 +38,16 @@ Notes:
   `-b <baud>`. Uploads go to `<path>.part` and are renamed into place only when
   complete. Install the console's UART driver with an RX buffer of at least 2 KB,
   enough for a full 1029-byte block.
+- `ota put` receives an application image the same way, into the OTA slot that isn't
+  running, writing each block as it arrives.
+  - ESP-IDF checks the whole image (header, chip, SHA-256) before it becomes the boot
+    image and the board restarts into it.
+  - A failed transfer, or a truncated or foreign image, leaves the running image booting.
+  - With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, the new image boots on trial. Call
+    `ota_confirm_running()` once the application is up; a reset before then boots the
+    previous image.
+  - `ota` lists the slots, their versions and states. `ota put -d` is a link test that
+    writes nothing.
 - `servo` drives hobby servos on PCA9685 boards over I2C, or on the chip's own pins
   with MCPWM (one timer each, so six on an S3).
   - Each servo has an absolute pulse range it is never driven outside, and a working
@@ -66,6 +76,7 @@ python tools/fs_xfer.py put -f --to clips data/leia.mjpeg.mov           # replac
 python tools/fs_xfer.py get leia.mjpeg.mov /tmp/leia.mov                 # download
 python tools/fs_xfer.py sha256 leia.mjpeg.mov                            # hash on the board
 python tools/fs_xfer.py run "fs ls" "fs df"                              # any console command
+python tools/fs_xfer.py ota build/holo-player-fw.bin                     # update the firmware, check it runs
 ```
 
 - **Checking uploads.** `put` sends each file's size, so the board stores exactly that
@@ -85,6 +96,13 @@ python tools/fs_xfer.py run "fs ls" "fs df"                              # any c
   help: 921600 managed only 7.5 KB/s. Data coming from the board above 230400 loses
   bytes whatever the block size. These limits come from the host driver, not the
   protocol, so try higher rates on other hosts.
+- **ACK before writing.** The receiver ACKs a block, then writes the one before it while
+  the next is arriving.
+  - Writing first delayed the ACK by a flash write's ~1.7 ms. At 460800, the CH34x driver
+    then dropped the sender's next block whole every few blocks, costing 10 s each.
+  - A 1.7 ms busy-wait in place of the write did the same, so the delay is the cause.
+  - ACKing first, a 1.26 MB `ota` image went up in 44 s (28 KB/s) with no retries.
+  - `-v` reports each resent block, and what arrived instead of its ACK.
 - **Resets on open.** The tool opens the port without toggling EN on boards with the
   usual DTR/RTS auto-reset circuit.
 - **One program at a time.** Close `idf.py monitor` before running the tool; only one

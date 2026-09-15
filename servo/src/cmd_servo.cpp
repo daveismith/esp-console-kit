@@ -272,6 +272,42 @@ static int config_servo(int argc, char **argv)
     return 0;
 }
 
+/* servo_off <ident>... | all: stop driving -- the servos go limp until their next move. */
+static struct {
+    struct arg_str *idents;
+    struct arg_end *end;
+} off_args;
+
+static int off_servo(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&off_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, off_args.end, argv[0]);
+        return 1;
+    }
+
+    ensure_attached();
+    std::vector<std::string> idents;
+    if (off_args.idents->count == 1 && strcmp(off_args.idents->sval[0], "all") == 0) {
+        for (const auto &entry : servo::ServoManager::GetInstance()->Servos()) {
+            idents.push_back(entry.first);
+        }
+    } else {
+        for (int i = 0; i < off_args.idents->count; i++) {
+            if (find_servo(off_args.idents->sval[i]) == nullptr) {
+                return 1;
+            }
+            idents.push_back(off_args.idents->sval[i]);
+        }
+    }
+    /* servo_set_enable() puts it on the wire at once, rather than at the next frame. */
+    for (const std::string &ident : idents) {
+        servo_set_enable(ident.c_str(), false);
+        printf("%s: off\n", ident.c_str());
+    }
+    return 0;
+}
+
 /* Every esp_console_cmd_t here names all seven members. In C the two unused ones could
  * be left out; this is C++, where GCC's -Wmissing-field-initializers fires on a
  * designated initializer too, and IDF builds with -Werror. */
@@ -343,9 +379,22 @@ extern "C" void register_servo(servo_attach_fn_t attach)
         .context = NULL,
     };
 
+    off_args.idents = arg_strn(NULL, NULL, "<ident>|all", 1, 32, "servos to stop driving, or all of them");
+    off_args.end = arg_end(2);
+    const esp_console_cmd_t off_servo_cmd = {
+        .command = "servo_off",
+        .help = "Stop driving servos: they go limp until their next move",
+        .hint = NULL,
+        .func = &off_servo,
+        .argtable = &off_args,
+        .func_w_context = NULL,
+        .context = NULL,
+    };
+
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_servos_cmd));
     ESP_ERROR_CHECK(esp_console_cmd_register(&attach_servos_cmd));
     ESP_ERROR_CHECK(esp_console_cmd_register(&move_servo_cmd));
     ESP_ERROR_CHECK(esp_console_cmd_register(&sweep_servo_cmd));
     ESP_ERROR_CHECK(esp_console_cmd_register(&config_servo_cmd));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&off_servo_cmd));
 }

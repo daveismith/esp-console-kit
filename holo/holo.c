@@ -202,6 +202,15 @@ static bool set_endpoints(const char *ident, bool clear, uint16_t closed_us, uin
                                    : def_endpoints(ident, clear, closed_us, open_us, why);
 }
 
+static void release_axis(const char *ident)
+{
+    if (s_cfg.axis_release != NULL) {
+        s_cfg.axis_release(ident, s_cfg.ctx);
+    } else if (servo_exists(ident)) {
+        servo_set_enable(ident, false);
+    }
+}
+
 /* ---- arithmetic ------------------------------------------------------------ */
 
 static float clampf(float v, float lo, float hi)
@@ -506,7 +515,7 @@ static const char *USAGE =
     "       holo <holo> led off | on [pct] | pulse [-l pct] [-p ms] | flicker [-l pct]\n"
     "                       | blink [-l pct] [-p ms]    ... [-t s]: then back to what it was\n"
     "       holo <holo> leia [-t s]           centre, and flicker, then the light goes back\n"
-    "       holo <holo> off                   stop, and the light off\n"
+    "       holo <holo> off                   stop, the axes limp, and the light off\n"
     "       holo <holo> endpoints <h|v> <closed> <open> | clear\n"
     "                                         an axis's travel in us, saved; closed above open\n"
     "                                         turns the axis round\n"
@@ -850,6 +859,10 @@ static void print_axis(const char *label, const char *ident)
     printf("       %-6s %-7s closed %u open %u us", label, ident, a.closed_us, a.open_us);
     if (a.placed) {
         printf(", at %u us", a.us);
+        bool driven = false, released = false;
+        if (servo_get_output(ident, &driven, &released) && !driven) {
+            printf(", limp");
+        }
     } else {
         printf(", not moved since boot");
     }
@@ -967,11 +980,15 @@ static int cmd_holo(int argc, char **argv)
                 if (!parse_opts(argc, argv, 3, "", &o)) {
                     r = 1;
                 } else {
+                    /* Motion stopped and the axes limp -- the next motion drives them again,
+                     * from where they were sent -- and the light off. */
                     stop_motion(i, NULL);
+                    release_axis(s_desc[i].h);
+                    release_axis(s_desc[i].v);
                     if (s_desc[i].led != NULL) {
                         set_led(i, (led_cfg_t){ LED_OFF, 100, 0 }, NULL, esp_timer_get_time());
                     }
-                    printf("%s: off\n", s_desc[i].name);
+                    printf("%s: off, axes limp\n", s_desc[i].name);
                     r = 0;
                 }
             } else if (strcmp(verb, "leia") == 0) {

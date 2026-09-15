@@ -1,6 +1,6 @@
 /*
  * Console commands for the servos: servo_list, servo_register, servo_move, servo_sweep,
- * servo_config.
+ * servo_config, servo_off.
  */
 #pragma once
 

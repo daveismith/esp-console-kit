@@ -250,6 +250,14 @@ esp_err_t xmodem_receive(const xmodem_io_t *io, const xmodem_config_t *config,
             if (good) {
                 const uint8_t num = frame[0];
                 if (num == expected) {
+                    /* ACK first, then hand over the block before this one while the next is
+                     * already on its way: the UART keeps receiving through a flash write (its
+                     * ISR is in IRAM). Handing over first delayed the ACK by a flash write's
+                     * ~1.7 ms, and at 460800 baud macOS's CH34x driver then dropped the whole
+                     * of the sender's next block every few blocks -- 10 s lost to each. The
+                     * same 1.7 ms as a busy-wait, with no flash write, did the same, so it is
+                     * the delay. A sink that fails now cancels the transfer a block later. */
+                    send_byte(io, ACK);
                     if (have_held) {
                         result = deliver(&st, held, held_len, false);
                         if (result != ESP_OK) {
@@ -263,7 +271,6 @@ esp_err_t xmodem_receive(const xmodem_io_t *io, const xmodem_config_t *config,
                     s->blocks++;
                     errors = 0;
                     noise = 0;
-                    send_byte(io, ACK);
                 } else if (num == (uint8_t)(expected - 1)) {
                     send_byte(io, ACK);   /* a resend: our ACK was lost */
                 } else {
@@ -279,10 +286,13 @@ esp_err_t xmodem_receive(const xmodem_io_t *io, const xmodem_config_t *config,
                 wait_quiet(io);
                 send_byte(io, NAK);
             }
-        } else if (c != 0 && ++noise > MAX_NOISE) {
+        } else if (c != 0) {
             /* Anything else where a header belongs is noise, and skipped -- up to a point. */
-            result = ESP_FAIL;
-            goto cancel;
+            s->skipped++;
+            if (++noise > MAX_NOISE) {
+                result = ESP_FAIL;
+                goto cancel;
+            }
         }
 
         if (!read_byte(io, &c, HEADER_TIMEOUT_MS)) {

@@ -4,7 +4,13 @@
   fs_xfer.py [-p PORT] put [-f] [--to DIR] [--no-verify] FILE...
   fs_xfer.py [-p PORT] get REMOTE [LOCAL]
   fs_xfer.py [-p PORT] sha256 REMOTE...
+  fs_xfer.py [-p PORT] ota [-n] IMAGE
   fs_xfer.py [-p PORT] run CMD...
+
+`ota` sends an application image (build/<project>.bin) to the board's `ota put`, into the
+OTA slot that is not running. The board verifies it and makes it the boot image, then
+restarts into it (not with -n); the tool waits for the console and checks that the new
+slot is the one running.
 
 `put` sends each file's size with it, so the board stores exactly that many bytes, then
 compares SHA-256: the hash of what the board received, and (unless --no-verify) the hash of
@@ -173,13 +179,20 @@ def read_exact(s, n, timeout, partial=None):
     return data if len(data) == n else None
 
 
-def wait_reply(s, timeout):
+VERBOSE = False
+
+
+def wait_reply(s, timeout, other=None):
+    """The next ACK, NAK or CAN, or None on timeout. Anything else read meanwhile is skipped,
+    and collected in `other` if given."""
     end = time.time() + timeout
     s.timeout = 0.2
     while time.time() < end:
         c = s.read(1)
         if c and c[0] in (ACK, NAK, CAN):
             return c[0]
+        if c and other is not None:
+            other.extend(c)
     return None
 
 
@@ -224,12 +237,17 @@ def xmodem_send(s, data, progress=None):
                  + payload + crc16(payload).to_bytes(2, 'big'))
         for attempt in range(11):
             write_frame(s, frame)
-            reply = wait_reply(s, 10)
+            other = bytearray()
+            t_sent = time.time()
+            reply = wait_reply(s, 10, other)
             if reply == ACK:
                 break
             if reply == CAN:
                 raise XmodemError(f'the board cancelled at block {num}')
             retries += 1
+            if VERBOSE:
+                print(f"\n  block {num}: {'NAK' if reply == NAK else 'no reply'} after "
+                      f"{time.time() - t_sent:.1f} s; other bytes meanwhile: {other.hex() or 'none'}")
         else:
             raise XmodemError(f'block {num} was never acknowledged')
         off += len(chunk)
@@ -425,6 +443,88 @@ def get(con, args):
     return True
 
 
+def ota(con, args):
+    with open(args.image, 'rb') as f:
+        data = f.read()
+    if not data or data[0] != 0xE9:
+        print(f'{args.image}: not an ESP application image (no 0xE9 header byte)')
+        return False
+    local_sha = hashlib.sha256(data).hexdigest()
+    flags = f' -b {args.xfer_baud}' if args.xfer_baud != args.baud else ''
+    if args.no_restart:
+        flags += ' -n'
+    if args.dry_run:
+        flags += ' -d'
+    print(f'{args.image} -> the next OTA slot ({len(data)} bytes, sha256 {local_sha[:16]}...)')
+
+    # The board erases the slot before it says it is ready: a few seconds for a megabyte.
+    m, text = con.start_transfer(f'ota put{flags} {len(data)}', timeout=60)
+    if not m:
+        print(f'  refused: {text.strip()}')
+        return False
+    slot = m.group(4)
+    if args.verbose:
+        print(f'  board: {m.group(0)}')
+    con.set_baud(args.xfer_baud)
+    t0 = time.time()
+    retries = None
+    try:
+        retries = xmodem_send(con.s, data, show_progress)
+    except EotUnconfirmed:
+        pass   # every block was acknowledged; the board's report below decides
+    except XmodemError as e:
+        print(f'\n  transfer failed: {e}')
+        con.set_baud(args.baud)
+        con.wait_prompt(15)
+        print('  ' + con.take().strip().replace('\n', '\n  '))
+        return False
+    secs = time.time() - t0
+    con.set_baud(args.baud)
+
+    # The board verifies the image and makes it the boot image, then restarts into it --
+    # or, with -n, comes back to its prompt.
+    end = time.time() + 30
+    while time.time() < end:
+        con.pump()
+        if 'ota: restarting' in ANSI.sub(b'', con.buf).decode('utf-8', 'replace') or con.at_prompt():
+            break
+    result = con.take()
+    lines = [l for l in result.replace('\r', '').split('\n') if l.strip() and not PROMPT.search(l.encode())]
+    print(f'  sent in {secs:.1f} s ({len(data) / 1024 / secs:.1f} KB/s, '
+          + (f'{retries} resent blocks)' if retries is not None
+             else 'end-of-transfer ACK lost on the way back)'))
+    print('  board: ' + '\n  board: '.join(lines))
+    m = SHA_LINE.search(result)
+    received_sha = m.group(1) if m else None
+    ok = received_sha == local_sha
+    print(f"  board received: sha256 {received_sha or '?'}  {'OK' if ok else 'MISMATCH'}")
+    if args.dry_run:
+        return ok
+    if not ok or 'now boots' not in result:
+        return False
+    if args.no_restart:
+        return True
+
+    # Back at the prompt after the restart, then ask which slot is running.
+    print('  waiting for it to come back...')
+    time.sleep(1.0)
+    end = time.time() + 40
+    back = False
+    while time.time() < end and not back:
+        con.take()
+        con.s.write(b'\r')
+        back = con.wait_prompt(2)
+    if not back:
+        print('  no console prompt after the restart')
+        return False
+    status = con.command('ota')
+    print('  ' + status.replace('\n', '\n  '))
+    running = next((l for l in status.split('\n') if 'running' in l), '')
+    ok = running.startswith(slot)
+    print(f"  {slot} running: {'OK' if ok else 'NO -- it did not switch, or rolled back'}")
+    return ok
+
+
 def default_port():
     if os.environ.get('ESPPORT'):
         return os.environ['ESPPORT']
@@ -460,11 +560,18 @@ def main():
     g.add_argument('local', nargs='?')
     h = sub.add_parser('sha256', help='hash files on the board')
     h.add_argument('remotes', nargs='+')
+    o = sub.add_parser('ota', help='update the firmware: send an app image to the next OTA slot')
+    o.add_argument('image', help='the application image, build/<project>.bin')
+    o.add_argument('-n', '--no-restart', action='store_true',
+                   help='make it the boot image, but leave the board running the old one')
+    o.add_argument('--dry-run', action='store_true',
+                   help='a link test: the board receives and hashes the image, and writes nothing')
     r = sub.add_parser('run', help='run console commands and print their output')
     r.add_argument('cmds', nargs='+')
     args = ap.parse_args()
-    global WRITE_CHUNK
+    global WRITE_CHUNK, VERBOSE
     WRITE_CHUNK = args.chunk
+    VERBOSE = args.verbose
     if not args.port:
         raise SystemExit('no port: pass -p or set ESPPORT')
 
@@ -476,6 +583,8 @@ def main():
             print(f"{sum(results)}/{len(results)} file(s) uploaded and verified" if len(results) > 1 else '')
         elif args.op == 'get':
             ok = get(con, args)
+        elif args.op == 'ota':
+            ok = ota(con, args)
         elif args.op == 'sha256':
             ok = True
             for remote in args.remotes:

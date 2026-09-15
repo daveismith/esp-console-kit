@@ -67,6 +67,9 @@ typedef struct {
     bool (*axis_move)(const char *ident, uint16_t permille, const char **why, void *ctx);
     bool (*endpoints)(const char *ident, bool clear, uint16_t closed_us, uint16_t open_us,
                       const char **why, void *ctx);
+    /** Stop driving an axis, so it goes limp (`holo off`); the next motion drives it again.
+     *  NULL: servo_set_enable(ident, false). */
+    void (*axis_release)(const char *ident, void *ctx);
     void *ctx;
     /**
      * With the default hooks: move a servo that has no saved calibration, over the working
