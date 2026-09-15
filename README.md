@@ -10,6 +10,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_network` | `register_network_commands()` | `ip addr` `ping` `iperf` `traceroute` `dig` |
 | `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
+| `cmd_fs` | `register_fs(&cfg)` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K |
 
 Notes:
 
@@ -25,6 +26,51 @@ Notes:
   reconnects when the link drops. `wifi_known_set_hook()` reports link changes to
   the application. It needs NVS and the default event loop before
   `wifi_known_start()`.
+
+- `cmd_fs` works on any mounted VFS volume. `cmd_fs_config_t` gives it the mount
+  point, an optional total/used callback for `df` (such as `esp_littlefs_info()`),
+  and the UART used for transfers (the console UART by default). Paths are
+  relative to the mount point.
+- `fs put`/`fs get` take the console UART raw for the transfer. They bypass the VFS
+  line-ending translation, mute log output, and can switch baud rate with
+  `-b <baud>`. Uploads go to `<path>.part` and are renamed into place only when
+  complete. Install the console's UART driver with an RX buffer of at least 2 KB,
+  enough for a full 1029-byte block.
+
+## Moving files: `tools/fs_xfer.py`
+
+The host side of `fs put`/`fs get`. It needs only pyserial; the ESP-IDF Python
+environment has it.
+
+```sh
+python tools/fs_xfer.py -p /dev/cu.wchusbserial... put data/*.mov        # upload, then verify SHA-256
+python tools/fs_xfer.py put -f --to clips data/leia.mjpeg.mov           # replace, into a directory
+python tools/fs_xfer.py get leia.mjpeg.mov /tmp/leia.mov                 # download
+python tools/fs_xfer.py sha256 leia.mjpeg.mov                            # hash on the board
+python tools/fs_xfer.py run "fs ls" "fs df"                              # any console command
+```
+
+- **Checking uploads.** `put` sends each file's size, so the board stores exactly that
+  many bytes; plain XMODEM would otherwise pad the last block. It then checks the
+  SHA-256 twice: once on the bytes the board received, and once on the file read
+  back from flash with `fs sha256`.
+- **Transfer speed.** Uploads run at `--xfer-baud` (default 460800), writing each block
+  in 512-byte pieces and waiting for each to drain (`--chunk`). Downloads run at
+  `--get-baud` (default 230400). The console returns to `--baud` afterwards. Uploads
+  ran at 21 KB/s on 100 KB, and at 7–10 KB/s on 1.6–1.9 MB video files (2.5–4.5
+  minutes each). Downloads ran at about 21 KB/s.
+- **Why those rates.** They were measured on macOS with a CH343P bridge and WCH's CH34x
+  driver. At 460800 and above, a whole 1029-byte block written in one go loses data
+  between the driver and the bridge. Sleeping for each piece's line time didn't stop
+  it, and neither did polling the output-queue count; only draining each piece
+  (`tcdrain`) held. Draining costs about 35 ms a call, so raising the rate doesn't
+  help: 921600 managed only 7.5 KB/s. Data coming from the board above 230400 loses
+  bytes whatever the block size. These limits come from the host driver, not the
+  protocol, so try higher rates on other hosts.
+- **Resets on open.** The tool opens the port without toggling EN on boards with the
+  usual DTR/RTS auto-reset circuit.
+- **One program at a time.** Close `idf.py monitor` before running the tool; only one
+  program can hold the port.
 
 ## Using it
 

@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Console command `fs`: ls, df, stat, mkdir, rmdir, rm, mv, cat, hexdump, sha256, bench, and XMODEM-1K put/get over the console UART"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"
