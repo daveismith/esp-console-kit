@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Holoprojector motions on two servo axes (center, move, nudge, twitch, wag, nod, scan, circle) and an optional light, with the `holo` console command"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"

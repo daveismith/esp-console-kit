@@ -11,6 +11,8 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
 | `cmd_fs` | `register_fs(&cfg)` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K |
+| `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` |
+| `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 
 Notes:
 
@@ -36,6 +38,22 @@ Notes:
   `-b <baud>`. Uploads go to `<path>.part` and are renamed into place only when
   complete. Install the console's UART driver with an RX buffer of at least 2 KB,
   enough for a full 1029-byte block.
+- `servo` drives hobby servos on PCA9685 boards over I2C, or on the chip's own pins
+  with MCPWM (one timer each, so six on an S3).
+  - Each servo has an absolute pulse range it is never driven outside, and a working
+    range, with invert, that percentages map onto.
+  - Each also has a drive policy: hold, or go limp once settled, per zone.
+  - The working range and policy are saved in NVS (namespace `servo`) under the board
+    address and channel, or the pin, so they follow the wiring.
+  - The application supplies the attach function, since only it knows what is fitted.
+  - `servo.h` is the C API; `docs/servo_model_spec.md` describes the model behind it.
+- `holo` moves a holoprojector's two servo axes, plus an optional light, on one task
+  at the 20 ms servo frame. The motions are twitch, wag, nod, scan, circle, and move
+  or nudge to a point.
+  - By default the axes are servo idents moved through `servo.h`.
+  - An application with its own servo registry or an arm switch passes hooks in
+    `holo_config_t` instead.
+  - With a single holo, `holo <verb>` works without naming it.
 
 ## Moving files: `tools/fs_xfer.py`
 
@@ -115,3 +133,6 @@ To work on a component locally, temporarily replace `git`/`version` with
   IDF 6.x and extended in r2_domeplayer.
 - `cmd_network` supersedes the standalone `daveismith/cmd_network` repo.
 - `wifi_known.c` comes from r2_domeplayer's `panel_net.c`.
+- `servo` is r2_domeplayer's `components/servo` (as of `8548fce`), with GPIO servos
+  attachable through the C API. `holo` is its `main/panel_holo.c`, with the dome's
+  joint registry and arm switch turned into hooks.

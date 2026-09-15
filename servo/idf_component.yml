@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Servos on PCA9685 boards or the chip's own pins (MCPWM): working ranges and a drive policy saved in NVS, a 20 ms frame task, a C API, and console commands servo_list, servo_register, servo_move, servo_sweep, servo_config"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"
