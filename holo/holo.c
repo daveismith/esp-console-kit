@@ -832,7 +832,7 @@ static int cmd_endpoints(size_t i, int argc, char **argv)
         return 1;
     }
     if (clear) {
-        printf("%s: %s back to its default range\n", s_desc[i].name, ident);
+        printf("%s: %s UNSET, back to its default range\n", s_desc[i].name, ident);
     } else {
         printf("%s: %s closed %ld open %ld us%s\n", s_desc[i].name, ident, closed, open,
                closed > open ? ", turned round" : "");
