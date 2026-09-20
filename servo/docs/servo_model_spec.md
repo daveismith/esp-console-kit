@@ -11,7 +11,10 @@ the panel fixes `drive_mid` at HOLD, ROS may set it; `settle_ms` floors at 100 o
 work over rmw_zenoh_pico. One measured correction: `raw_step` on this board is 5, since a
 PCA9685 tick at 50 Hz is 4.88 µs. §5's rule that an explicit enable or disable wins only
 until the next motion command holds: any move drives the output, released or switched off;
-the arm interlock is what keeps a disarmed servo still, and every caller checks it.
+an explicit release is what makes a servo still. **This implementation's arm switch gates its
+own control panel only** (changed 2026-09-17): commands from ROS, the console and the droid's
+buttons are never refused `not armed`, and dropping every output is a separate control. The
+refusal stays in the vocabulary below for controllers whose interlock does gate the wire.
 
 A common description of a servo, and a common way to reach one over ROS 2, so that a control
 panel can present an edit screen for *any* servo on the droid without knowing which controller
@@ -65,7 +68,7 @@ core. Adding to it:
 | **Enabled state** | Whether the output stage is live *right now*. An observable, mostly set by the drive policy — distinct from armed. |
 | **Owning controller** | With several servos per node and several nodes per droid, an edit screen needs to know where to send a command. Discovered, not configured. |
 | **Capability flags** | So the screen greys out what a PWM servo cannot do rather than showing dead controls. |
-| **Safety interlock** | Something must be able to refuse motion. This panel has an arm switch; the protocol has to carry the refusal. |
+| **Safety interlock** | Something must be able to refuse motion, and the protocol has to carry the refusal — whether or not a given controller has one. This panel's arm switch gates its own screen rather than the wire, so it never sends `not armed`; a controller with a hardware interlock will. |
 | **Velocity / effort limits** | URDF already carries them. Not needed to configure endpoints, needed the moment anything moves on a profile. |
 
 **Trim is deliberately absent.** An earlier draft carried a signed `raw_trim` offset applied on
@@ -218,17 +221,24 @@ Rules:
 
 | mode | unit | clamped to | used for | preconditions |
 | --- | --- | --- | --- | --- |
-| **Joint** | radians | `joint_lower..joint_upper`, then `raw_min..raw_max` | normal motion, ROS, choreography | armed, calibrated |
-| **Raw** | raw units | `raw_min..raw_max` only | setting endpoints, bring-up | armed, and an explicit maintenance intent |
+| **Joint** | radians | `joint_lower..joint_upper`, then `raw_min..raw_max` | normal motion, ROS, choreography | calibrated (plus any interlock the controller has) |
+| **Raw** | raw units | `raw_min..raw_max` only | setting endpoints, bring-up | an explicit maintenance intent (plus any interlock) |
 
 Raw mode deliberately bypasses the endpoints — you cannot calibrate through the calibration.
 
-**The controller's gate for both modes is the same interlock: armed.** That is not a shortfall.
-Arming already means "this droid may move things now", and on this project it already permits
-precisely what raw mode needs — the endpoint editor edits the endpoints and drives past them
-while armed, and refuses everything while not. A second maintenance flag beside it would add a
-state to reason about without adding a decision, since whatever could set the second could set
-the first.
+**Whatever interlock a controller has, it is the same for both modes.** A second maintenance
+flag beside it would add a state to reason about without adding a decision, since whatever
+could set the second could set the first.
+
+**On this implementation the interlock is not on the wire at all** (changed 2026-09-17). The
+arm switch gates the panel's own servo screens and nothing else; ROS, the console and the
+droid's buttons command servos armed or not. Two things drove that. An interlock a remote
+client cannot see or clear is a refusal it can only report and wait on — and the same switch
+was the only way to make the droid physically safe, so "I want nothing to move" and "I want
+this panel to stop accepting presses" were one control with one state between them. Dropping
+every output is now its own command, available from every surface, and it works whether or not
+the panel is armed. A controller whose interlock is a physical key or an e-stop should still
+gate the wire and send `not armed`; the protocol carries it either way.
 
 **Separating configuration from ordinary use is the client's job, and it is structural rather
 than a flag.** A raw move *is* the declaration of maintenance intent — that is the entire
