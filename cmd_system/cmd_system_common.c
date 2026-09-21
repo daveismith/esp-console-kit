@@ -19,6 +19,7 @@
 #include <inttypes.h>
 #include "esp_log.h"
 #include "esp_console.h"
+#include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -109,6 +110,16 @@ static int get_version(int argc, char **argv)
         printf("Get flash size failed");
         return 1;
     }
+    /* The running firmware first: it is what `version` is usually asked for, and until now the
+       one thing this command did not say. The version string is PROJECT_VER, which ESP-IDF takes
+       from `git describe` unless the project sets it, so a release build reports its tag and a
+       development build reports the commit it came from, with -dirty for uncommitted changes. */
+    const esp_app_desc_t *app = esp_app_get_description();
+    char elf_sha[17];
+    esp_app_get_elf_sha256(elf_sha, sizeof(elf_sha));
+    printf("App:%s %s\r\n", app->project_name, app->version);
+    printf("\tbuilt:%s %s\r\n", app->date, app->time);
+    printf("\tELF SHA-256:%s\r\n", elf_sha);
     printf("IDF Version:%s\r\n", esp_get_idf_version());
     printf("Chip info:\r\n");
     printf("\tmodel:%s\r\n", model);
@@ -127,7 +138,7 @@ static void register_version(void)
 {
     const esp_console_cmd_t cmd = {
         .command = "version",
-        .help = "Get version of chip and SDK",
+        .help = "The running firmware's version and build, then the IDF version and the chip",
         .hint = NULL,
         .func = &get_version,
     };
