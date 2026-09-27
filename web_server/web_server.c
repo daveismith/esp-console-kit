@@ -893,23 +893,9 @@ static void add_ip(cJSON *o, const char *key, esp_ip4_addr_t ip)
     cJSON_AddStringToObject(o, key, s);
 }
 
-static esp_err_t info_get(httpd_req_t *req)
+cJSON *web_sta_json(void)
 {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "api", 1);
-    cJSON_AddItemToObject(root, "firmware", web_app_desc_json(esp_app_get_description()));
-    cJSON_AddStringToObject(root, "chip", CONFIG_IDF_TARGET);
-    cJSON_AddStringToObject(root, "hostname", s_hostname);
-    cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
-    cJSON_AddNumberToObject(root, "heap_free", (double)esp_get_free_heap_size());
-    cJSON *features = cJSON_AddArrayToObject(root, "features");
-    for (size_t i = 0; i < s_n_features; i++) {
-        cJSON_AddItemToArray(features, cJSON_CreateString(s_features[i]));
-    }
-    cJSON_AddBoolToObject(root, "auth", have_password());
-    cJSON_AddStringToObject(root, "via", web_req_via_ap(req) ? "ap" : "sta");
-
-    cJSON *sta = cJSON_AddObjectToObject(root, "sta");
+    cJSON *sta = cJSON_CreateObject();
     cJSON_AddBoolToObject(sta, "enabled", wifi_known_is_enabled());
     esp_netif_t *sn = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     wifi_ap_record_t rec;
@@ -938,6 +924,26 @@ static esp_err_t info_get(httpd_req_t *req)
         }
 #endif
     }
+    return sta;
+}
+
+static esp_err_t info_get(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "api", 1);
+    cJSON_AddItemToObject(root, "firmware", web_app_desc_json(esp_app_get_description()));
+    cJSON_AddStringToObject(root, "chip", CONFIG_IDF_TARGET);
+    cJSON_AddStringToObject(root, "hostname", s_hostname);
+    cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
+    cJSON_AddNumberToObject(root, "heap_free", (double)esp_get_free_heap_size());
+    cJSON *features = cJSON_AddArrayToObject(root, "features");
+    for (size_t i = 0; i < s_n_features; i++) {
+        cJSON_AddItemToArray(features, cJSON_CreateString(s_features[i]));
+    }
+    cJSON_AddBoolToObject(root, "auth", have_password());
+    cJSON_AddStringToObject(root, "via", web_req_via_ap(req) ? "ap" : "sta");
+
+    cJSON_AddItemToObject(root, "sta", web_sta_json());
 
     wifi_ap_info_t ap;
     wifi_ap_get_info(&ap);

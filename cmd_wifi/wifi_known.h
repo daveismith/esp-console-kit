@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -51,6 +52,29 @@ esp_err_t wifi_known_join(const char *ssid, const char *passphrase);
 
 /* Drop a stored credential, and the link if it is the one in use. */
 esp_err_t wifi_known_forget(const char *ssid, bool *was_stored);
+
+/* Each stored network: its SSID, whether it has a passphrase (never what it is), and whether it
+ * is the one rejoined at boot. Under the store's lock: `cb` must not block. False stops. */
+typedef bool (*wifi_known_list_cb_t)(const char *ssid, bool has_passphrase, bool last, void *ctx);
+void wifi_known_list(wifi_known_list_cb_t cb, void *ctx);
+bool wifi_known_has(const char *ssid);
+
+/* Store a network without joining it (a NULL or empty passphrase for an open one): it is
+ * joined when wifi_known_join() names it. The store keeps 16; a 17th forgets the oldest.
+ * ESP_ERR_INVALID_ARG for an SSID of 0 or over 32 bytes, or a passphrase outside 8..63. */
+esp_err_t wifi_known_save(const char *ssid, const char *passphrase);
+
+/* The networks in range, one entry an SSID (its strongest), strongest first; hidden ones
+ * left out. Blocks for the scan, about 2-3 s. ESP_ERR_WIFI_STATE while the station is
+ * connecting. */
+typedef struct {
+    char ssid[33];
+    int rssi;
+    unsigned channel;
+    const char *auth;           /* "open", "wep", "wpa", "wpa2", "wpa3", "enterprise", "other" */
+    bool known;
+} wifi_known_scan_t;
+esp_err_t wifi_known_scan(wifi_known_scan_t *out, size_t max, size_t *found);
 
 /* `wifi on|off`: whether the station should be connected. Off keeps the stored networks. */
 void wifi_known_set_enabled(bool enabled);

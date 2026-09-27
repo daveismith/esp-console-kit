@@ -650,6 +650,110 @@ void wifi_known_set_enabled(bool enabled)
     }
 }
 
+void wifi_known_list(wifi_known_list_cb_t cb, void *ctx)
+{
+    lock();
+    known_load();
+    for (uint32_t i = 0; i < s_known.count; i++) {
+        const known_entry_t *e = &s_known.entries[i];
+        if (!cb(e->ssid, e->passphrase[0] != '\0', strcmp(s_known.last, e->ssid) == 0, ctx)) {
+            break;
+        }
+    }
+    unlock();
+}
+
+bool wifi_known_has(const char *ssid)
+{
+    lock();
+    const bool has = known_find(ssid) != NULL;
+    unlock();
+    return has;
+}
+
+esp_err_t wifi_known_save(const char *ssid, const char *passphrase)
+{
+    const size_t n = ssid != NULL ? strlen(ssid) : 0;
+    const size_t p = passphrase != NULL ? strlen(passphrase) : 0;
+    if (n == 0 || n >= SSID_LEN || (p != 0 && (p < 8 || p >= PASS_LEN))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    lock();
+    known_put(ssid, p ? passphrase : "", false);
+    unlock();
+    return ESP_OK;
+}
+
+static const char *auth_name(wifi_auth_mode_t a)
+{
+    switch (a) {
+    case WIFI_AUTH_OPEN:            return "open";
+    case WIFI_AUTH_WEP:             return "wep";
+    case WIFI_AUTH_WPA_PSK:         return "wpa";
+    case WIFI_AUTH_WPA2_PSK:
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "wpa2";
+    case WIFI_AUTH_WPA3_PSK:
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "wpa3";
+    case WIFI_AUTH_ENTERPRISE:
+    case WIFI_AUTH_WPA3_ENTERPRISE:
+    case WIFI_AUTH_WPA2_WPA3_ENTERPRISE:
+    case WIFI_AUTH_WPA3_ENT_192:    return "enterprise";
+    default:                        return "other";
+    }
+}
+
+static int by_rssi(const void *a, const void *b)
+{
+    return ((const wifi_known_scan_t *)b)->rssi - ((const wifi_known_scan_t *)a)->rssi;
+}
+
+esp_err_t wifi_known_scan(wifi_known_scan_t *out, size_t max, size_t *found)
+{
+    *found = 0;
+    const wifi_scan_config_t cfg = { .show_hidden = false };
+    esp_err_t err = esp_wifi_scan_start(&cfg, true);
+    if (err != ESP_OK) {
+        return err;     /* ESP_ERR_WIFI_STATE while the station is connecting */
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    wifi_ap_record_t *recs = n ? calloc(n, sizeof(*recs)) : NULL;
+    if (n && recs == NULL) {
+        esp_wifi_clear_ap_list();
+        return ESP_ERR_NO_MEM;
+    }
+    err = esp_wifi_scan_get_ap_records(&n, recs);
+    for (uint16_t i = 0; err == ESP_OK && i < n; i++) {
+        const char *ssid = (const char *)recs[i].ssid;
+        if (ssid[0] == '\0') {
+            continue;       /* hidden */
+        }
+        /* One entry an SSID: its strongest access point */
+        size_t k = 0;
+        while (k < *found && strcmp(out[k].ssid, ssid) != 0) {
+            k++;
+        }
+        if (k == *found) {
+            if (*found == max) {
+                continue;
+            }
+            (*found)++;
+        } else if (out[k].rssi >= recs[i].rssi) {
+            continue;
+        }
+        strlcpy(out[k].ssid, ssid, sizeof(out[k].ssid));
+        out[k].rssi = recs[i].rssi;
+        out[k].channel = recs[i].primary;
+        out[k].auth = auth_name(recs[i].authmode);
+    }
+    free(recs);
+    for (size_t k = 0; k < *found; k++) {
+        out[k].known = wifi_known_has(out[k].ssid);
+    }
+    qsort(out, *found, sizeof(*out), by_rssi);
+    return err;
+}
+
 bool wifi_known_is_enabled(void)
 {
     return s_want_connected;
@@ -706,8 +810,26 @@ static int cmd_wifi_power(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "ap") == 0) {
         return wifi_ap_command(argc - 1, argv + 1);
     }
+    if (argc == 2 && strcmp(argv[1], "scan") == 0) {
+        wifi_known_scan_t *nets = calloc(32, sizeof(*nets));
+        size_t n = 0;
+        const esp_err_t err = nets != NULL ? wifi_known_scan(nets, 32, &n) : ESP_ERR_NO_MEM;
+        if (err != ESP_OK) {
+            printf("wifi scan: %s%s\n", esp_err_to_name(err),
+                   err == ESP_ERR_WIFI_STATE ? " (joining a network: try again in a moment)" : "");
+        }
+        for (size_t i = 0; i < n; i++) {
+            printf("%-32s %4d dBm  ch %-2u  %-10s%s\n", nets[i].ssid, nets[i].rssi, nets[i].channel, nets[i].auth,
+                   nets[i].known ? "  saved" : "");
+        }
+        if (err == ESP_OK && n == 0) {
+            printf("no networks in range\n");
+        }
+        free(nets);
+        return err == ESP_OK ? 0 : 1;
+    }
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "on") != 0 && strcmp(argv[1], "off") != 0)) {
-        printf("usage: wifi [on|off] | wifi ap [on|off] [--ssid <ssid>] [--pass <passphrase>]\n");
+        printf("usage: wifi [on|off] | wifi scan | wifi ap [on|off] [--ssid <ssid>] [--pass <passphrase>]\n");
         return 1;
     }
     if (argc == 2) {
@@ -817,8 +939,8 @@ void wifi_known_register_commands(void)
     const esp_console_cmd_t wifi_cmd = {
         .command = "wifi",
         .help = "WiFi on or off, the stored networks untouched; alone, the link and the default route. "
-                "`wifi ap` runs the board's own access point, on demand",
-        .hint = "[on|off] | ap [on|off] [--ssid <ssid>] [--pass <passphrase>]",
+                "`wifi scan` lists the networks in range; `wifi ap` runs the board's own access point, on demand",
+        .hint = "[on|off] | scan | ap [on|off] [--ssid <ssid>] [--pass <passphrase>]",
         .func = cmd_wifi_power,
         .argtable = NULL,
     };

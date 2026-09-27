@@ -86,6 +86,10 @@ bool web_query_bool(httpd_req_t *req, const char *key, bool dflt);
 /* Whether the request came in on the access point, not the station. */
 bool web_req_via_ap(httpd_req_t *req);
 
+/* The station, as /api/v1/info gives it: enabled, connected; ssid, ip, rssi, channel, ipv6 when
+ * connected. */
+cJSON *web_sta_json(void);
+
 /* JSON of an esp_app_desc_t: project, version, date, time, idf, elf_sha256. */
 cJSON *web_app_desc_json(const esp_app_desc_t *d);
 
