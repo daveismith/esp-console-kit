@@ -68,6 +68,14 @@ esp_err_t servo_attach_pca9685(int i2c_port, uint8_t address, const char *prefix
 esp_err_t servo_attach_gpio(int gpio, const char *ident, uint16_t abs_min_us, uint16_t abs_max_us,
                             uint16_t op_min_us, uint16_t op_max_us);
 
+/** @brief How many servos are registered, and the ident of the index-th (in ident order),
+ *         copied into `out`; false past the end. */
+size_t servo_count(void);
+bool servo_ident(size_t index, char *out, size_t out_len);
+
+/** @brief The pin of a servo attached with servo_attach_gpio(); -1 for any other. */
+int servo_gpio(const char *id);
+
 /** @brief How many controllers (boards) are attached. */
 size_t servo_controller_count(void);
 

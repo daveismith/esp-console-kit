@@ -621,22 +621,11 @@ static const char *motion_refusal(size_t i, const char **ident)
     return NULL;
 }
 
-static bool refuse_motion(size_t i)
-{
-    const char *ident = NULL;
-    const char *why = motion_refusal(i, &ident);
-    if (why == NULL) return false;
-    if (ident != NULL) {
-        printf("%s: refused, %s (%s)\n", s_desc[i].name, why, ident);
-    } else {
-        printf("%s: refused, %s\n", s_desc[i].name, why);
-    }
-    return true;
-}
+static void set_led(size_t i, led_cfg_t cfg, const opts_t *o, int64_t now);
 
 /* A new motion: from where the axis hook says the axes are, sending the first frame
- * whatever it is, so the channels are driven from the start. */
-static void begin(size_t i, motion_t m, const opts_t *o, int64_t now)
+ * whatever it is, so the channels are driven from the start. `time_s` > 0 ends it then. */
+static void begin(size_t i, motion_t m, float time_s, int64_t now)
 {
     holo_t *h = &s_holo[i];
     locate(i);
@@ -647,34 +636,118 @@ static void begin(size_t i, motion_t m, const opts_t *o, int64_t now)
     h->ox = h->x;
     h->oy = h->y;
     h->step = 0;
-    h->motion_until = (o != NULL && o->has_t) ? now + (int64_t)(o->t * 1e6f) : 0;
+    h->motion_until = time_s > 0 ? now + (int64_t)(time_s * 1e6f) : 0;
+}
+
+/*
+ * Start `m` on holo i, the lock held. NULL, or why it was refused (a HOLO_WHY_*), with the axis
+ * at fault in *ident. The parameters are already in range; 0 (or -1 for duration_ms) is the
+ * motion's default.
+ */
+static const char *start_motion(size_t i, const holo_motion_t *m, const char **ident)
+{
+    holo_t *h = &s_holo[i];
+    const int64_t now = esp_timer_get_time();
+    *ident = NULL;
+    if (m->kind == HOLO_STOP) {
+        stop_motion(i, NULL);
+        return NULL;
+    }
+    if (m->kind == HOLO_OFF) {
+        /* Motion stopped and the axes limp -- the next motion drives them again, from where
+         * they were sent -- and the light off. */
+        stop_motion(i, NULL);
+        release_axis(s_desc[i].h);
+        release_axis(s_desc[i].v);
+        if (s_desc[i].led != NULL) {
+            set_led(i, (led_cfg_t){ LED_OFF, 100, 0 }, NULL, now);
+        }
+        return NULL;
+    }
+    const char *why = motion_refusal(i, ident);
+    if (why != NULL) {
+        return why;
+    }
+    switch (m->kind) {
+    case HOLO_CENTER:
+    case HOLO_MOVE:
+    case HOLO_NUDGE: {
+        begin(i, MOT_MOVE, 0, now);
+        float tx = m->kind == HOLO_CENTER ? 0.0f : (float)m->x / 100.0f;
+        float ty = m->kind == HOLO_CENTER ? 0.0f : (float)m->y / 100.0f;
+        if (m->kind == HOLO_NUDGE) {
+            tx += h->x;
+            ty += h->y;
+        }
+        tx = clampf(tx, -1.0f, 1.0f);
+        ty = clampf(ty, -1.0f, 1.0f);
+        const int64_t dur = m->duration_ms >= 0 ? (int64_t)m->duration_ms * 1000
+                                                 : travel_us(tx - h->x, ty - h->y, 250, 500);
+        segment(h, tx, ty, dur, true, now);
+        break;
+    }
+    case HOLO_TWITCH:
+        begin(i, MOT_TWITCH, m->time_s, now);
+        h->range = (float)(m->range ? m->range : 60) / 100.0f;
+        h->min_ms = (uint32_t)((m->interval_min_s > 0 ? m->interval_min_s : 1.0f) * 1000);
+        h->max_ms = (uint32_t)((m->interval_max_s > 0 ? m->interval_max_s : 5.0f) * 1000);
+        h->next_us = now;   /* the first glance at once */
+        break;
+    case HOLO_SCAN:
+        begin(i, MOT_SCAN, m->time_s, now);
+        h->range = (float)(m->range ? m->range : 70) / 100.0f;
+        h->period_ms = (uint32_t)(m->period_ms ? m->period_ms : 6000);
+        next_segment(i, now);
+        break;
+    case HOLO_WAG:
+    case HOLO_NOD:
+    case HOLO_CIRCLE: {
+        const bool wag = m->kind == HOLO_WAG, nod = m->kind == HOLO_NOD;
+        begin(i, wag ? MOT_WAG : nod ? MOT_NOD : MOT_CIRCLE, 0, now);
+        const int n = m->count ? m->count : (wag ? 3 : nod ? 2 : 1);
+        h->range = (float)(m->range ? m->range : (wag ? 50 : nod ? 40 : 50)) / 100.0f;
+        h->period_ms = (uint32_t)(m->period_ms ? m->period_ms : (wag ? 700 : nod ? 800 : 2400));
+        h->total = h->left = wag || nod ? 2 * n + 1 : CIRCLE_STEPS * n + 2;
+        next_segment(i, now);
+        break;
+    }
+    default:
+        break;
+    }
+    return NULL;
 }
 
 static int cmd_motion(size_t i, const char *verb, int argc, char **argv)
 {
     holo_t *h = &s_holo[i];
     opts_t o = { 0 };
-    const int64_t now = esp_timer_get_time();
 
     /* Known verbs first: an unknown one is a usage error, not a motion to refuse. */
-    static const char *const VERBS[] = { "stop", "center", "centre", "move", "nudge", "twitch",
-                                         "wag", "nod", "scan", "circle" };
+    static const struct { const char *verb; holo_motion_kind_t kind; } VERBS[] = {
+        { "stop", HOLO_STOP }, { "center", HOLO_CENTER }, { "centre", HOLO_CENTER }, { "move", HOLO_MOVE },
+        { "nudge", HOLO_NUDGE }, { "twitch", HOLO_TWITCH }, { "wag", HOLO_WAG }, { "nod", HOLO_NOD },
+        { "scan", HOLO_SCAN }, { "circle", HOLO_CIRCLE },
+    };
+    holo_motion_t m = { .kind = HOLO_OFF, .duration_ms = -1 };
     bool known = false;
     for (size_t k = 0; k < sizeof(VERBS) / sizeof(VERBS[0]); k++) {
-        known |= strcmp(verb, VERBS[k]) == 0;
+        if (strcmp(verb, VERBS[k].verb) == 0) {
+            m.kind = VERBS[k].kind;
+            known = true;
+        }
     }
     if (!known) return -1;
 
-    if (strcmp(verb, "stop") == 0) {
+    if (m.kind == HOLO_STOP) {
         if (argc > 3) return printf("holo: stop takes nothing\n"), 1;
-        stop_motion(i, NULL);
+        const char *ident;
+        start_motion(i, &m, &ident);
         printf("%s: holding\n", s_desc[i].name);
         return 0;
     }
 
     long x = 0, y = 0;
-    const bool is_move = strcmp(verb, "move") == 0, is_nudge = strcmp(verb, "nudge") == 0;
-    const bool is_center = strcmp(verb, "center") == 0 || strcmp(verb, "centre") == 0;
+    const bool is_move = m.kind == HOLO_MOVE, is_nudge = m.kind == HOLO_NUDGE;
     int from = 3;
     if (is_move || is_nudge) {
         const long lim = is_move ? 100 : 200;
@@ -684,60 +757,55 @@ static int cmd_motion(size_t i, const char *verb, int argc, char **argv)
         }
         from = 5;
     }
-    const char *allowed = is_move || is_nudge || is_center ? "d"
-                        : strcmp(verb, "twitch") == 0 ? "rit"
-                        : strcmp(verb, "scan") == 0 ? "rpt"
+    const char *allowed = is_move || is_nudge || m.kind == HOLO_CENTER ? "d"
+                        : m.kind == HOLO_TWITCH ? "rit"
+                        : m.kind == HOLO_SCAN ? "rpt"
                         : "nrp";   /* wag, nod, circle */
     if (!parse_opts(argc, argv, from, allowed, &o)) return 1;
-    if (refuse_motion(i)) return 1;
+    m.x = (int)x;
+    m.y = (int)y;
+    m.duration_ms = o.has_d ? (int)o.d : -1;
+    m.range = o.has_r ? (int)o.r : 0;
+    m.count = o.has_n ? (int)o.n : 0;
+    m.period_ms = o.has_p ? (int)o.p : 0;
+    m.interval_min_s = o.has_i ? o.imin : 0;
+    m.interval_max_s = o.has_i ? o.imax : 0;
+    m.time_s = o.has_t ? o.t : 0;
 
-    if (is_move || is_nudge || is_center) {
-        begin(i, MOT_MOVE, NULL, now);
-        float tx = is_center ? 0.0f : (float)x / 100.0f, ty = is_center ? 0.0f : (float)y / 100.0f;
-        if (is_nudge) {
-            tx += h->x;
-            ty += h->y;
+    const char *ident = NULL;
+    const char *why = start_motion(i, &m, &ident);
+    if (why != NULL) {
+        if (ident != NULL) {
+            printf("%s: refused, %s (%s)\n", s_desc[i].name, why, ident);
+        } else {
+            printf("%s: refused, %s\n", s_desc[i].name, why);
         }
-        tx = clampf(tx, -1.0f, 1.0f);
-        ty = clampf(ty, -1.0f, 1.0f);
-        const int64_t dur = o.has_d ? (int64_t)o.d * 1000 : travel_us(tx - h->x, ty - h->y, 250, 500);
-        segment(h, tx, ty, dur, true, now);
-        printf("%s: to x %+d%% y %+d%% in %d ms\n", s_desc[i].name, (int)lroundf(tx * 100),
-               (int)lroundf(ty * 100), (int)(dur / 1000));
-        return 0;
+        return 1;
     }
-    if (strcmp(verb, "twitch") == 0) {
-        begin(i, MOT_TWITCH, &o, now);
-        h->range = (float)(o.has_r ? o.r : 60) / 100.0f;
-        h->min_ms = (uint32_t)((o.has_i ? o.imin : 1.0f) * 1000);
-        h->max_ms = (uint32_t)((o.has_i ? o.imax : 5.0f) * 1000);
-        h->next_us = now;   /* the first glance at once */
+    switch (m.kind) {
+    case HOLO_CENTER:
+    case HOLO_MOVE:
+    case HOLO_NUDGE:
+        printf("%s: to x %+d%% y %+d%% in %d ms\n", s_desc[i].name, (int)lroundf(h->x1 * 100),
+               (int)lroundf(h->y1 * 100), (int)(h->seg_us / 1000));
+        break;
+    case HOLO_TWITCH:
         printf("%s: twitching within %d%% of the centre, every %.1f-%.1f s\n", s_desc[i].name,
                (int)lroundf(h->range * 100), h->min_ms / 1000.0, h->max_ms / 1000.0);
-        return 0;
-    }
-    if (strcmp(verb, "scan") == 0) {
-        begin(i, MOT_SCAN, &o, now);
-        h->range = (float)(o.has_r ? o.r : 70) / 100.0f;
-        h->period_ms = (uint32_t)(o.has_p ? o.p : 6000);
-        next_segment(i, now);
+        break;
+    case HOLO_SCAN:
         printf("%s: scanning %d%% each side, %u ms a sweep there and back\n", s_desc[i].name,
                (int)lroundf(h->range * 100), (unsigned)h->period_ms);
-        return 0;
+        break;
+    default: {
+        const bool wag_nod = m.kind == HOLO_WAG || m.kind == HOLO_NOD;
+        const int n = wag_nod ? (h->total - 1) / 2 : (h->total - 2) / CIRCLE_STEPS;
+        printf("%s: %s %d %s of %d%%, %u ms each\n", s_desc[i].name, verb, n,
+               wag_nod ? "cycles" : "turns", (int)lroundf(h->range * 100), (unsigned)h->period_ms);
+        break;
     }
-    const bool wag = strcmp(verb, "wag") == 0, nod = strcmp(verb, "nod") == 0;
-    if (wag || nod || strcmp(verb, "circle") == 0) {
-        begin(i, wag ? MOT_WAG : nod ? MOT_NOD : MOT_CIRCLE, NULL, now);
-        const long n = o.has_n ? o.n : (wag ? 3 : nod ? 2 : 1);
-        h->range = (float)(o.has_r ? o.r : (wag ? 50 : nod ? 40 : 50)) / 100.0f;
-        h->period_ms = (uint32_t)(o.has_p ? o.p : (wag ? 700 : nod ? 800 : 2400));
-        h->total = h->left = wag || nod ? (int)(2 * n + 1) : (int)(CIRCLE_STEPS * n + 2);
-        next_segment(i, now);
-        printf("%s: %s %ld %s of %d%%, %u ms each\n", s_desc[i].name, verb, n,
-               wag || nod ? "cycles" : "turns", (int)lroundf(h->range * 100), (unsigned)h->period_ms);
-        return 0;
     }
-    return -1;   /* not a motion verb */
+    return 0;
 }
 
 static void set_led(size_t i, led_cfg_t cfg, const opts_t *o, int64_t now)
@@ -980,14 +1048,9 @@ static int cmd_holo(int argc, char **argv)
                 if (!parse_opts(argc, argv, 3, "", &o)) {
                     r = 1;
                 } else {
-                    /* Motion stopped and the axes limp -- the next motion drives them again,
-                     * from where they were sent -- and the light off. */
-                    stop_motion(i, NULL);
-                    release_axis(s_desc[i].h);
-                    release_axis(s_desc[i].v);
-                    if (s_desc[i].led != NULL) {
-                        set_led(i, (led_cfg_t){ LED_OFF, 100, 0 }, NULL, esp_timer_get_time());
-                    }
+                    const holo_motion_t off = { .kind = HOLO_OFF };
+                    const char *ident;
+                    start_motion(i, &off, &ident);
                     printf("%s: off, axes limp\n", s_desc[i].name);
                     r = 0;
                 }
@@ -1007,7 +1070,7 @@ static int cmd_holo(int argc, char **argv)
                     const char *ident = NULL;
                     const char *why = motion_refusal(i, &ident);
                     if (why == NULL) {
-                        begin(i, MOT_MOVE, NULL, now);
+                        begin(i, MOT_MOVE, 0, now);
                         segment(&s_holo[i], 0, 0, travel_us(s_holo[i].x, s_holo[i].y, 250, 500), true, now);
                         printf("%s: leia for %.1f s, centred\n", s_desc[i].name, o.t);
                     } else {
@@ -1030,6 +1093,93 @@ static int cmd_holo(int argc, char **argv)
     xSemaphoreGive(s_lock);
     xTaskNotifyGive(s_task);
     return rc;
+}
+
+/* ---- the C API ----------------------------------------------------------------- */
+
+size_t holo_count(void)
+{
+    return s_task != NULL ? s_count : 0;
+}
+
+const char *holo_name(size_t idx)
+{
+    return idx < s_count ? s_desc[idx].name : NULL;
+}
+
+/* The parameters within the console's ranges; false with why. */
+static bool motion_in_range(const holo_motion_t *m, char *why, size_t why_len)
+{
+    const int lim = m->kind == HOLO_NUDGE ? 200 : 100;
+    if ((m->kind == HOLO_MOVE || m->kind == HOLO_NUDGE) && (abs(m->x) > lim || abs(m->y) > lim)) {
+        snprintf(why, why_len, "`x` and `y` for %s are -%d..%d", m->kind == HOLO_MOVE ? "move" : "nudge", lim, lim);
+    } else if (m->duration_ms > 10000) {
+        snprintf(why, why_len, "`duration_ms` is 0..10000");
+    } else if (m->range < 0 || m->range > 100) {
+        snprintf(why, why_len, "`range` is 1..100");
+    } else if (m->count < 0 || m->count > 20) {
+        snprintf(why, why_len, "`count` is 1..20");
+    } else if (m->period_ms != 0 && (m->period_ms < 200 || m->period_ms > 60000)) {
+        snprintf(why, why_len, "`period_ms` is 200..60000");
+    } else if ((m->interval_min_s != 0 || m->interval_max_s != 0) &&
+               !(m->interval_min_s >= 0.1f && m->interval_max_s <= 600.0f && m->interval_min_s <= m->interval_max_s)) {
+        snprintf(why, why_len, "`interval_s` is [min, max], each 0.1..600, min first");
+    } else if (m->time_s != 0 && !(m->time_s >= 0.1f && m->time_s <= 3600.0f)) {
+        snprintf(why, why_len, "`time_s` is 0.1..3600");
+    } else {
+        return true;
+    }
+    return false;
+}
+
+esp_err_t holo_motion(size_t idx, const holo_motion_t *m, char *why, size_t why_len)
+{
+    if (s_task == NULL || idx >= s_count) {
+        snprintf(why, why_len, s_task == NULL ? "not started" : "no such holo");
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!motion_in_range(m, why, why_len)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const char *ident = NULL;
+    const char *refused = start_motion(idx, m, &ident);
+    xSemaphoreGive(s_lock);
+    xTaskNotifyGive(s_task);
+    if (refused != NULL) {
+        if (ident != NULL) {
+            snprintf(why, why_len, "%s: refused, %s (%s)", s_desc[idx].name, refused, ident);
+        } else {
+            snprintf(why, why_len, "%s: refused, %s", s_desc[idx].name, refused);
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+esp_err_t holo_status(size_t idx, holo_status_t *out)
+{
+    if (s_task == NULL || idx >= s_count) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const holo_t *h = &s_holo[idx];
+    const holo_desc_t *d = &s_desc[idx];
+    out->name = d->name;
+    const char *ident = NULL;
+    out->why = motion_refusal(idx, &ident);
+    out->why_axis = ident;
+    out->ready = out->why == NULL;
+    out->motion = MOTION_NAMES[h->motion];
+    out->stopped = h->stopped;
+    out->has_light = d->led != NULL;
+    holo_axis_t ax, ay;
+    out->placed = get_axis(d->h, &ax) && get_axis(d->v, &ay) && ax.placed && ay.placed;
+    out->x = out->placed ? from_permille(ax.permille) : h->x;
+    out->y = out->placed ? from_permille(ay.permille) : h->y;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
 }
 
 void holo_register_command(void)

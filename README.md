@@ -11,10 +11,10 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
 | `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h`; `fs_ops.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
-| `web_api` | `web_fs_register()` | HTTP: `/api/v1/fs*` (the volume: list, stat, upload, download, move, copy, delete) |
+| `web_api` | `web_fs_register()`, `web_servo_register(before_move)` | HTTP: `/api/v1/fs*` (the volume: list, stat, upload, download, move, copy, delete); `/api/v1/servos*` (positions, moves, calibration, drive policy) |
 | `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname` `web cors`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, `/api/v1/web`, and `/api/v1/ota*` |
 | `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
-| `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
+| `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()`; `holo_motion()`, `holo_status()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 
 Notes:
 
@@ -95,6 +95,7 @@ Notes:
     address and channel, or the pin, so they follow the wiring.
   - The application supplies the attach function, since only it knows what is fitted.
   - `servo.h` is the C API; `docs/servo_model_spec.md` describes the model behind it.
+    `servo_count()` and `servo_ident()` list the servos, `servo_gpio()` gives a pin's.
 - `holo` moves a holoprojector's two servo axes, plus an optional light, on one task
   at the 20 ms servo frame. The motions are twitch, wag, nod, scan, circle, and move
   or nudge to a point.
@@ -102,6 +103,8 @@ Notes:
   - An application with its own servo registry or an arm switch passes hooks in
     `holo_config_t` instead.
   - With a single holo, `holo <verb>` works without naming it.
+  - `holo_motion()` and `holo_status()` are the console's verbs and status for other callers
+    (an HTTP API), with the same ranges and refusals.
 
 ## Moving files: `tools/fs_xfer.py`
 

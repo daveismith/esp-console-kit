@@ -4,6 +4,7 @@
  */
 #include "servo.h"
 
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -114,6 +115,33 @@ extern "C" esp_err_t servo_attach_gpio(int gpio, const char *ident, uint16_t abs
     ESP_LOGI(TAG, "gpio %d: servo %s, %u..%u us%s", gpio, ident, op_min, op_max,
              servo->Calibrated() ? " (saved)" : "");
     return ESP_OK;
+}
+
+extern "C" size_t servo_count(void)
+{
+    return ServoManager::GetInstance()->Servos().size();
+}
+
+extern "C" bool servo_ident(size_t index, char *out, size_t out_len)
+{
+    const auto servos = ServoManager::GetInstance()->Servos();
+    if (index >= servos.size() || out_len == 0) {
+        return false;
+    }
+    strlcpy(out, servos[index].first.c_str(), out_len);
+    return true;
+}
+
+extern "C" int servo_gpio(const char *id)
+{
+    Servo *servo = ServoManager::GetInstance()->GetServo(id);
+    std::lock_guard<std::mutex> guard(s_attach_lock);
+    for (const auto &entry : s_gpio_servos) {
+        if (servo != nullptr && static_cast<Servo *>(entry.second) == servo) {
+            return entry.first;
+        }
+    }
+    return -1;
 }
 
 extern "C" size_t servo_controller_count(void)
