@@ -134,6 +134,10 @@ typedef struct {
 
 esp_err_t holo_status(size_t idx, holo_status_t *out);
 
+/** The last motion asked of holo `idx` -- by the console or any caller -- as it was asked; before
+ *  any, a HOLO_STOP. With holo_status(), what it takes to put a holo back to what it was doing. */
+bool holo_last_motion(size_t idx, holo_motion_t *out);
+
 /** Holos the engine runs (0 before holo_start()); their names. */
 size_t holo_count(void);
 const char *holo_name(size_t idx);

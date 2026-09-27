@@ -104,6 +104,7 @@ static size_t s_count;
 static holo_config_t s_cfg;
 static holo_t *s_holo;
 static spot_t *s_spot;
+static holo_motion_t *s_last;   /* each holo's last motion asked for, by any caller */
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_task;
 
@@ -480,12 +481,14 @@ esp_err_t holo_start(const holo_desc_t *holos, size_t count, const holo_config_t
     /* PSRAM where there is some: internal DRAM is the tight pool. */
     s_holo = heap_caps_calloc_prefer(count, sizeof(holo_t), 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_8BIT);
     s_spot = calloc(2 * count, sizeof(spot_t));
-    if (s_lock == NULL || s_holo == NULL || s_spot == NULL) {
+    s_last = calloc(count, sizeof(holo_motion_t));
+    if (s_lock == NULL || s_holo == NULL || s_spot == NULL || s_last == NULL) {
         ESP_LOGE(TAG, "out of memory; the holoprojectors are off");
         return ESP_ERR_NO_MEM;
     }
     for (size_t i = 0; i < count; i++) {
         s_holo[i] = (holo_t){ .led = { LED_OFF, 100, 2000 }, .sent_h = 0xffff, .sent_v = 0xffff };
+        s_last[i] = (holo_motion_t){ .kind = HOLO_STOP, .duration_ms = -1 };
     }
     /* A PSRAM stack where there is PSRAM: safe only because nothing on this path writes
      * flash. Internal RAM otherwise. */
@@ -649,6 +652,9 @@ static const char *start_motion(size_t i, const holo_motion_t *m, const char **i
     holo_t *h = &s_holo[i];
     const int64_t now = esp_timer_get_time();
     *ident = NULL;
+    if (s_last != NULL) {
+        s_last[i] = *m;
+    }
     if (m->kind == HOLO_STOP) {
         stop_motion(i, NULL);
         return NULL;
@@ -1154,6 +1160,17 @@ esp_err_t holo_motion(size_t idx, const holo_motion_t *m, char *why, size_t why_
         return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
+}
+
+bool holo_last_motion(size_t idx, holo_motion_t *out)
+{
+    if (s_task == NULL || idx >= s_count || s_last == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    *out = s_last[idx];
+    xSemaphoreGive(s_lock);
+    return true;
 }
 
 esp_err_t holo_status(size_t idx, holo_status_t *out)
