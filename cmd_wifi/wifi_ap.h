@@ -1,7 +1,8 @@
 /*
  * wifi_ap -- the board's own access point, for when there is no network to join: phones and
- * laptops connect to it directly. On demand only (`wifi ap on`), never persisted: every boot
- * starts with it off. See wifi_ap.c.
+ * laptops connect to it directly. On demand (`wifi ap on`), or for a while (wifi_ap_start_for(),
+ * an app's fallback when it can't join a network); never persisted: every boot starts with it
+ * off. See wifi_ap.c.
  */
 #pragma once
 
@@ -20,10 +21,11 @@ typedef struct {
     uint32_t ip;                /* network byte order, as esp_ip4_addr_t */
     uint8_t channel;
     int clients;
+    uint32_t off_in_s;          /* on for a while: seconds until it turns off; 0 stays on */
 } wifi_ap_info_t;
 
 /*
- * Start the access point, alongside the station if it is up (APSTA). WPA2 with the stored
+ * Start the access point (or keep one that is on, to stay), alongside the station if it is up (APSTA). WPA2 with the stored
  * SSID and passphrase: by default `<CONFIG_CMD_WIFI_AP_SSID_PREFIX>-xxxx` (the end of the
  * station MAC) and a random passphrase made on first use and kept in NVS. Its DHCP server
  * hands out the board as DNS server and as the captive-portal URL, and a small DNS
@@ -31,6 +33,13 @@ typedef struct {
  */
 esp_err_t wifi_ap_start(void);
 esp_err_t wifi_ap_stop(void);
+
+/*
+ * The same, for `seconds`, and then off. Again while on for a while starts the count over; an
+ * access point turned on to stay (wifi_ap_start()) stays. wifi_ap_start() and wifi_ap_stop()
+ * cancel the count.
+ */
+esp_err_t wifi_ap_start_for(uint32_t seconds);
 bool wifi_ap_is_on(void);
 void wifi_ap_get_info(wifi_ap_info_t *out);
 

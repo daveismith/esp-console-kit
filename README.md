@@ -84,7 +84,10 @@ Notes:
     `CONFIG_WEB_SERVER_PULL_STACK_SIZE`, never on the server's.
 - `wifi_known` also lists the stored networks (`wifi_known_list()`), stores one without joining
   (`wifi_known_save()`), and scans (`wifi_known_scan()`, and `wifi scan` on the console).
-- `wifi_ap` runs the board's own access point, on demand and never persisted: WPA2 with a random
+- `wifi_known_is_connected()`: whether the station has an address.
+- `wifi_ap` runs the board's own access point, on demand and never persisted -- or for a while,
+  `wifi_ap_start_for(seconds)`, then off by itself (an app's fallback when it can't join a
+  network; `off_in_s` in its info and the API, `off in m:ss` in `wifi ap`): WPA2 with a random
   passphrase kept in NVS (the MAC is the BSSID, so it would be a poor secret), DHCP offering the
   board as DNS and captive portal, and a small DNS responder answering every name with the board.
   `CONFIG_CMD_WIFI_AP_SSID_PREFIX` names it `<prefix>-xxxx`.

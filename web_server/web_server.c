@@ -953,6 +953,9 @@ static esp_err_t info_get(httpd_req_t *req)
         cJSON_AddStringToObject(apo, "ssid", ap.ssid);
         add_ip(apo, "ip", (esp_ip4_addr_t){ .addr = ap.ip });
         cJSON_AddNumberToObject(apo, "clients", ap.clients);
+        if (ap.off_in_s != 0) {
+            cJSON_AddNumberToObject(apo, "off_in_s", ap.off_in_s);
+        }
     }
     return web_send_json(req, 200, root);
 }

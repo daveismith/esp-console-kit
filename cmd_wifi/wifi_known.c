@@ -759,6 +759,11 @@ bool wifi_known_is_enabled(void)
     return s_want_connected;
 }
 
+bool wifi_known_is_connected(void)
+{
+    return s_have_ip;
+}
+
 /* ------------------------------------------------------------------ console */
 
 static bool route_on_wifi(void)

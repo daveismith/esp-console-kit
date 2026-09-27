@@ -47,6 +47,9 @@ static cJSON *network_json(void)
         cJSON_AddStringToObject(apo, "ip", ip);
         cJSON_AddNumberToObject(apo, "channel", ap.channel);
         cJSON_AddNumberToObject(apo, "clients", ap.clients);
+        if (ap.off_in_s != 0) {
+            cJSON_AddNumberToObject(apo, "off_in_s", ap.off_in_s);
+        }
     }
     return root;
 }
@@ -241,6 +244,7 @@ static esp_err_t ap_patch(httpd_req_t *req)
     cJSON *apo = cJSON_GetObjectItem(root, "ap");
     if (want >= 0) {
         cJSON_ReplaceItemInObject(apo, "on", cJSON_CreateBool(want));
+        cJSON_DeleteItemFromObject(apo, "off_in_s");    /* on now stays on */
     }
     if (want == 0) {
         cJSON_DeleteItemFromObject(apo, "ip");      /* as GET says of an access point that is off */
@@ -255,7 +259,7 @@ static esp_err_t ap_patch(httpd_req_t *req)
         wifi_ap_set_credentials(s[0] ? s : NULL, p[0] ? p : NULL);
         memset(p, 0, sizeof(p));
     }
-    if (want == 1 && !wifi_ap_is_on()) {
+    if (want == 1) {
         wifi_ap_start();
     } else if (want == 0 && wifi_ap_is_on()) {
         wifi_ap_stop();

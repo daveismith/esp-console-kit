@@ -80,6 +80,9 @@ esp_err_t wifi_known_scan(wifi_known_scan_t *out, size_t max, size_t *found);
 void wifi_known_set_enabled(bool enabled);
 bool wifi_known_is_enabled(void);
 
+/* Whether the station is on a network and has an IPv4 address. */
+bool wifi_known_is_connected(void);
+
 #ifdef __cplusplus
 }
 #endif

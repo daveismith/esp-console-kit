@@ -15,6 +15,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,6 +32,8 @@ static const char *TAG = "wifi_ap";
 
 static bool s_on;
 static char s_portal_uri[32];       /* DHCP option 114 keeps a pointer to it */
+static esp_timer_handle_t s_off_timer;  /* on for a while: turns it off */
+static int64_t s_off_at_us;         /* when, by esp_timer_get_time(); 0 stays on */
 
 void wifi_ap_default_name(const char *prefix, char *out, size_t out_len)
 {
@@ -166,7 +169,8 @@ static void setup_dhcp(esp_netif_t *ap)
 #endif
 }
 
-esp_err_t wifi_ap_start(void)
+/* Up with the stored credentials, or restarted with them; the count, if any, runs on. */
+static esp_err_t ap_up(void)
 {
     wifi_bringup();
     esp_netif_t *ap = esp_netif_get_handle_from_ifkey(AP_IFKEY);
@@ -204,10 +208,63 @@ esp_err_t wifi_ap_start(void)
     return ESP_OK;
 }
 
+static void cancel_off(void)
+{
+    s_off_at_us = 0;
+    if (s_off_timer != NULL) {
+        esp_timer_stop(s_off_timer);
+    }
+}
+
+esp_err_t wifi_ap_start(void)
+{
+    cancel_off();
+    return wifi_ap_is_on() ? ESP_OK : ap_up();
+}
+
+static void off_timer_cb(void *arg)
+{
+    (void)arg;
+    if (s_off_at_us == 0) {
+        return;     /* turned on to stay since */
+    }
+    ESP_LOGI(TAG, "access point off: its time is up");
+    wifi_ap_stop();
+}
+
+esp_err_t wifi_ap_start_for(uint32_t seconds)
+{
+    if (seconds == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (wifi_ap_is_on() && s_off_at_us == 0) {
+        return ESP_OK;      /* on to stay */
+    }
+    if (s_off_timer == NULL) {
+        const esp_timer_create_args_t args = { .callback = off_timer_cb, .name = "wifi_ap_off" };
+        esp_err_t err = esp_timer_create(&args, &s_off_timer);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    esp_err_t err = wifi_ap_is_on() ? ESP_OK : ap_up();
+    if (err != ESP_OK) {
+        return err;
+    }
+    esp_timer_stop(s_off_timer);
+    s_off_at_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
+    err = esp_timer_start_once(s_off_timer, (uint64_t)seconds * 1000000);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "access point on for %u s", (unsigned)seconds);
+    }
+    return err;
+}
+
 esp_err_t wifi_ap_stop(void)
 {
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_wifi_get_mode(&mode);
+    cancel_off();
     s_on = false;
     if (mode == WIFI_MODE_APSTA || mode == WIFI_MODE_AP) {
         /* Station mode even from AP alone: wifi_known joins from there */
@@ -251,6 +308,11 @@ void wifi_ap_get_info(wifi_ap_info_t *out)
         if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) {
             out->clients = list.num;
         }
+        const int64_t off_at = s_off_at_us;
+        if (off_at != 0) {
+            const int64_t left = off_at - esp_timer_get_time();
+            out->off_in_s = left > 0 ? (uint32_t)((left + 999999) / 1000000) : 1;
+        }
     }
 }
 
@@ -278,7 +340,7 @@ esp_err_t wifi_ap_set_credentials(const char *ssid, const char *passphrase)
     }
     nvs_close(h);
     if (err == ESP_OK && wifi_ap_is_on()) {
-        err = wifi_ap_start();
+        err = ap_up();
     }
     return err;
 }
@@ -293,6 +355,10 @@ static void print_ap(void)
         esp_ip4_addr_t ip = { .addr = ap.ip };
         printf("ap: on, %s, channel %u, %d client%s\n", ap.ssid, ap.channel, ap.clients,
                ap.clients == 1 ? "" : "s");
+        if (ap.off_in_s != 0) {
+            printf("off in %u:%02u (`wifi ap on` keeps it on)\n", (unsigned)(ap.off_in_s / 60),
+                   (unsigned)(ap.off_in_s % 60));
+        }
         printf("pass: %s\n", ap.passphrase);
         printf("page: http://" IPSTR "/\n", IP2STR(&ip));
     } else {
