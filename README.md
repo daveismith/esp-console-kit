@@ -56,14 +56,14 @@ Notes:
   flash writes would disturb.
 - `web_server` serves an application's embedded pages (`web_asset_t`, gzipped) and a JSON API.
   Routes are registered with `web_register()` from any component. Changes (PUT, POST,
-  DELETE) must name the board in `Host` and, for POST, be `application/json` or
-  `application/octet-stream`, so other sites' pages can't drive it; `web password` adds a
+  DELETE) must name the board in `Host` and, for POST, be `application/json`, so other sites'
+  pages can't drive it; `web password` adds a
   password (Bearer or Basic). Origins on a CORS allowlist (`CONFIG_WEB_SERVER_CORS_ORIGINS`,
   `https://*.example.com` for subdomains; `web cors` changes it, in NVS) may call the API from a
   browser, preflights answered. mDNS announces `<name>.local`; unknown paths from the access
   point redirect to the page, for phones' captive-portal checks. Needs `espressif/cjson` and
   `espressif/mdns` (managed components).
-  - `web_ota_register()` adds the `/api/v1/ota` routes over `ota_core`: upload (PUT/POST,
+  - `web_ota_register()` adds the `/api/v1/ota` routes over `ota_core`: upload (PUT,
     streamed, on its own task), session state, slots, activate, discard, pull, check.
   - `ota_pull` downloads an image from a URL or a release manifest (`parts[]` with `role:
     "app"`, `path`, `size`, `sha256`), refusing https-to-http redirects. `ota_pull_set_resolver()`

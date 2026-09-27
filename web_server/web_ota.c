@@ -133,7 +133,7 @@ static esp_err_t image_get(httpd_req_t *req)
     return web_send_json(req, 200, session_json());
 }
 
-/* ------------------------------------------------------------------ PUT/POST /ota/image */
+/* ------------------------------------------------------------------ PUT /ota/image */
 
 typedef struct {
     httpd_req_t *req;
@@ -532,7 +532,6 @@ esp_err_t web_ota_register(void)
     err |= web_register("/api/v1/ota", HTTP_GET, ota_get, 0);
     err |= web_register("/api/v1/ota/image", HTTP_GET, image_get, 0);
     err |= web_register("/api/v1/ota/image", HTTP_PUT, image_put, WEB_AUTH);
-    err |= web_register("/api/v1/ota/image", HTTP_POST, image_put, WEB_AUTH);
     err |= web_register("/api/v1/ota/image", HTTP_DELETE, image_delete, WEB_AUTH);
     err |= web_register("/api/v1/ota/activate", HTTP_POST, activate_post, WEB_AUTH);
     err |= web_register("/api/v1/ota/pull", HTTP_POST, pull_post, WEB_AUTH);

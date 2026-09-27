@@ -7,10 +7,10 @@
  *    header -- an IP address, `<hostname>` or `<hostname>.local`. A web page elsewhere that
  *    rebinds its own DNS name to the board's address still sends its own name, so it is
  *    refused.
- *  - A POST must say it carries JSON or an image (Content-Type application/json or
- *    application/octet-stream). A page elsewhere can only send those after a CORS preflight,
- *    which this server never approves, so a page the user happens to visit cannot drive the
- *    board -- even with no password set.
+ *  - A POST must say it carries JSON (Content-Type application/json). A page elsewhere can only
+ *    send that -- or a PUT or DELETE at all -- after a CORS preflight, which this server
+ *    approves only for the allowlist below, so a page the user happens to visit cannot drive
+ *    the board -- even with no password set.
  *  - With a password set (`web password`), routes registered WEB_AUTH also need it, as HTTP
  *    Basic (any user name) or as a Bearer token. Reading is always open.
  *  - CORS: pages from the origins on an allowlist -- CONFIG_WEB_SERVER_CORS_ORIGINS, or what
@@ -643,10 +643,8 @@ static esp_err_t dispatch(httpd_req_t *req)
             return web_send_error(req, 403, "forbidden_host",
                                   "the Host header must be the board's address or %s.local", s_hostname);
         }
-        if (req->method == HTTP_POST && !content_type_is(req, "application/json") &&
-            !content_type_is(req, "application/octet-stream")) {
-            return web_send_error(req, 415, "content_type",
-                                  "a POST must be Content-Type: application/json (or application/octet-stream for an image)");
+        if (req->method == HTTP_POST && !content_type_is(req, "application/json")) {
+            return web_send_error(req, 415, "content_type", "a POST must be Content-Type: application/json");
         }
         if ((r->flags & WEB_AUTH) && !authorised(req)) {
             vTaskDelay(pdMS_TO_TICKS(500));     /* a guess at a time */
