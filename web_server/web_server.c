@@ -13,6 +13,12 @@
  *    board -- even with no password set.
  *  - With a password set (`web password`), routes registered WEB_AUTH also need it, as HTTP
  *    Basic (any user name) or as a Bearer token. Reading is always open.
+ *  - CORS: pages from the origins on an allowlist -- CONFIG_WEB_SERVER_CORS_ORIGINS, or what
+ *    `web cors` stored -- may call the API from a browser (API tools such as Swagger Editor, a
+ *    project's own documentation). Their preflights are answered and their replies carry
+ *    Access-Control-Allow-Origin; every other origin is refused as before. The checks above
+ *    still apply to them, so with no password an allowed site can drive the board: `web cors`
+ *    says so.
  *
  * Unknown paths: an embedded asset if there is one; a JSON 404 under /api; otherwise, for a
  * request that came in on the access point, a redirect to the board's page -- which is what
@@ -54,6 +60,7 @@ typedef struct {
     web_handler_t handler;
     unsigned flags;
     bool live;                  /* registered with the running server */
+    bool preflight;             /* this route also registered the path's OPTIONS handler */
 } route_t;
 
 static web_server_config_t s_cfg;
@@ -65,6 +72,7 @@ static size_t s_n_features;
 static char s_hostname[33];
 static char s_etag[20];
 static bool s_mdns_up;
+static char s_cors[CONFIG_WEB_SERVER_CORS_MAX_LEN];   /* space-separated origins */
 
 /* ------------------------------------------------------------------ settings */
 
@@ -112,6 +120,101 @@ static bool have_password(void)
 {
     char pw[65];
     return nvs_str("password", pw, sizeof(pw));
+}
+
+/* The CORS allowlist: the stored one if `web cors` ever changed it (even to nothing), else the
+ * build's default. */
+static void load_cors(void)
+{
+    nvs_handle_t h;
+    size_t n = sizeof(s_cors);
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        const esp_err_t err = nvs_get_str(h, "cors", s_cors, &n);
+        nvs_close(h);
+        if (err == ESP_OK) {
+            return;
+        }
+    }
+    strlcpy(s_cors, CONFIG_WEB_SERVER_CORS_ORIGINS, sizeof(s_cors));
+}
+
+static bool cors_stored(void)
+{
+    nvs_handle_t h;
+    size_t n = 0;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    const bool stored = nvs_get_str(h, "cors", NULL, &n) == ESP_OK;
+    nvs_close(h);
+    return stored;
+}
+
+/*
+ * `origin` (scheme://host[:port], from the Origin header) against one allowlist entry: the same,
+ * case aside; a host of `*.domain` (after the scheme), any subdomain of domain at any depth, not
+ * domain itself; or `*`, anything.
+ */
+static bool origin_matches(const char *origin, const char *pat, size_t pat_len)
+{
+    if (pat_len == 1 && pat[0] == '*') {
+        return true;
+    }
+    const char *os = strstr(origin, "://");
+    const char *ps = NULL;
+    for (size_t i = 0; i + 3 <= pat_len; i++) {
+        if (strncmp(pat + i, "://", 3) == 0) {
+            ps = pat + i;
+            break;
+        }
+    }
+    if (os == NULL || ps == NULL || os - origin != ps - pat || strncasecmp(origin, pat, os - origin) != 0) {
+        return false;
+    }
+    const char *oh = os + 3;
+    const char *ph = ps + 3;
+    const size_t phl = pat_len - (ph - pat);
+    if (oh[0] == '\0' || strpbrk(oh, "/@\\ ") != NULL) {
+        return false;       /* an Origin is scheme://host[:port], nothing more */
+    }
+    if (phl > 2 && ph[0] == '*' && ph[1] == '.') {
+        const size_t sl = phl - 1;              /* ".domain" */
+        const size_t ol = strlen(oh);
+        return ol > sl && oh[ol - sl - 1] != '.' && strncasecmp(oh + ol - sl, ph + 1, sl) == 0;
+    }
+    return strlen(oh) == phl && strncasecmp(oh, ph, phl) == 0;
+}
+
+static bool origin_allowed(const char *origin)
+{
+    for (const char *p = s_cors; *p; ) {
+        while (*p == ' ') {
+            p++;
+        }
+        const size_t n = strcspn(p, " ");
+        if (n > 0 && origin_matches(origin, p, n)) {
+            return true;
+        }
+        p += n;
+    }
+    return false;
+}
+
+/* The request's Origin, when it is on the allowlist. The CORS headers point into `c`, which must
+ * live until the reply is sent. */
+typedef struct {
+    char origin[128];
+} cors_t;
+
+static bool cors_headers(httpd_req_t *req, cors_t *c)
+{
+    if (httpd_req_get_hdr_value_str(req, "Origin", c->origin, sizeof(c->origin)) != ESP_OK ||
+        !origin_allowed(c->origin)) {
+        return false;
+    }
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", c->origin);
+    httpd_resp_set_hdr(req, "Vary", "Origin");
+    return true;
 }
 
 const char *web_server_hostname(void)
@@ -188,6 +291,10 @@ esp_err_t web_send_json(httpd_req_t *req, int status, cJSON *root)
     httpd_resp_set_status(req, status_line(status));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    cors_t cors;
+    if (cors_headers(req, &cors)) {
+        httpd_resp_set_hdr(req, "Access-Control-Expose-Headers", "WWW-Authenticate");
+    }
     const esp_err_t err = httpd_resp_sendstr(req, text);
     cJSON_free(text);
     return err;
@@ -361,6 +468,8 @@ static esp_err_t send_asset(httpd_req_t *req, const web_asset_t *a)
     /* The assets are part of the image: they change exactly when the image does */
     char tag[24];
     snprintf(tag, sizeof(tag), "\"%s\"", s_etag);
+    cors_t cors;
+    cors_headers(req, &cors);   /* /api/v1/openapi.json, for an API tool to load */
     char seen[24];
     if (httpd_req_get_hdr_value_str(req, "If-None-Match", seen, sizeof(seen)) == ESP_OK &&
         strcmp(seen, tag) == 0) {
@@ -547,13 +656,49 @@ static esp_err_t dispatch(httpd_req_t *req)
     return r->handler(req);
 }
 
+/* A CORS preflight: which methods and headers an allowed origin may use. */
+static esp_err_t preflight(httpd_req_t *req)
+{
+    cors_t cors;
+    if (!cors_headers(req, &cors)) {
+        return web_send_error(req, 403, "cors", "this site is not allowed to call the board (`web cors` on its console)");
+    }
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Authorization, Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Max-Age", "600");
+    char pna[8];
+    if (httpd_req_get_hdr_value_str(req, "Access-Control-Request-Private-Network", pna, sizeof(pna)) == ESP_OK) {
+        /* Chrome's consent for a public site to reach a device on the local network */
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Private-Network", "true");
+    }
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static esp_err_t register_live(route_t *r)
 {
     const httpd_uri_t uri = { .uri = r->uri, .method = r->method, .handler = dispatch, .user_ctx = r };
-    const esp_err_t err = httpd_register_uri_handler(s_server, &uri);
+    esp_err_t err = httpd_register_uri_handler(s_server, &uri);
     r->live = err == ESP_OK;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "%s: %s", r->uri, esp_err_to_name(err));
+        return err;
+    }
+    /* One OPTIONS handler a path, for CORS preflights, with the path's first route */
+    r->preflight = true;
+    for (route_t *o = s_routes; o < r; o++) {
+        if (o->preflight && o->live && strcmp(o->uri, r->uri) == 0) {
+            r->preflight = false;
+            break;
+        }
+    }
+    if (r->preflight) {
+        const httpd_uri_t opt = { .uri = r->uri, .method = HTTP_OPTIONS, .handler = preflight };
+        err = httpd_register_uri_handler(s_server, &opt);
+        if (err != ESP_OK) {
+            r->preflight = false;
+            ESP_LOGE(TAG, "OPTIONS %s: %s", r->uri, esp_err_to_name(err));
+        }
     }
     return err;
 }
@@ -684,7 +829,7 @@ static esp_err_t start_httpd(void)
     }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = CONFIG_WEB_SERVER_STACK_SIZE;
-    config.max_uri_handlers = CONFIG_WEB_SERVER_MAX_ROUTES;
+    config.max_uri_handlers = 2 * CONFIG_WEB_SERVER_MAX_ROUTES;   /* and one OPTIONS a path */
     config.max_open_sockets = CONFIG_WEB_SERVER_MAX_SOCKETS;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 10;
@@ -710,6 +855,7 @@ static void stop_httpd(void)
         s_server = NULL;
         for (size_t i = 0; i < s_n_routes; i++) {
             s_routes[i].live = false;
+            s_routes[i].preflight = false;
         }
     }
 }
@@ -726,6 +872,7 @@ esp_err_t web_server_start(const web_server_config_t *cfg)
     esp_app_get_elf_sha256(elf, sizeof(elf));
     strlcpy(s_etag, elf, sizeof(s_etag));
     load_hostname();
+    load_cors();
 
     static bool builtins;
     if (!builtins) {
@@ -763,6 +910,119 @@ static void print_web(void)
         printf("  http://" IPSTR "/  on the access point %s\n", IP2STR(&a), ap.ssid);
     }
     printf("password: %s\n", have_password() ? "set: changes need it" : "none: anyone on the network can update the board");
+    printf("cors: %s\n", s_cors[0] ? s_cors : "none: only the board's own pages call its API from a browser");
+}
+
+/* An allowlist entry: `*`, or scheme://host[:port] with an optional `*.` before the host. */
+static bool valid_origin(const char *o)
+{
+    if (strcmp(o, "*") == 0) {
+        return true;
+    }
+    const char *s = strstr(o, "://");
+    if (s == NULL || s == o || strlen(o) >= 96) {
+        return false;
+    }
+    for (const char *p = o; p < s; p++) {
+        if (!isalpha((unsigned char)*p)) {
+            return false;
+        }
+    }
+    const char *h = s + 3;
+    if (strncmp(h, "*.", 2) == 0) {
+        h += 2;
+    }
+    if (*h == '\0' || *h == '.' || *h == ':') {
+        return false;
+    }
+    for (; *h; h++) {
+        if (!isalnum((unsigned char)*h) && *h != '.' && *h != '-' && *h != ':') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void print_cors(void)
+{
+    printf("cors: %s%s\n", s_cors[0] ? s_cors : "none", cors_stored() ? "" : " (the default)");
+    if (s_cors[0]) {
+        printf("pages from these origins may call the API from a browser%s\n",
+               have_password() ? "; changes still need the password"
+                               : ". With no password set they can also update and restart the board: "
+                                 "`web password` guards that");
+    }
+}
+
+/* web cors [add <origin> | remove <origin> | reset | none] */
+static int cors_cmd(int argc, char **argv)
+{
+    if (argc == 0) {
+        print_cors();
+        return 0;
+    }
+    char list[sizeof(s_cors)];
+    if (argc == 1 && strcmp(argv[0], "reset") == 0) {
+        nvs_put_str("cors", NULL);
+        load_cors();
+        print_cors();
+        return 0;
+    }
+    if (argc == 1 && strcmp(argv[0], "none") == 0) {
+        list[0] = '\0';
+    } else if (argc == 2 && (strcmp(argv[0], "add") == 0 || strcmp(argv[0], "remove") == 0)) {
+        const bool add = argv[0][0] == 'a';
+        char origin[96];
+        strlcpy(origin, argv[1], sizeof(origin));
+        const size_t ol = strlen(origin);
+        if (ol > 0 && origin[ol - 1] == '/') {
+            origin[ol - 1] = '\0';     /* as copied from an address bar */
+        }
+        if (add && !valid_origin(origin)) {
+            printf("web cors: an origin is scheme://host[:port], as https://editor.swagger.io; "
+                   "https://*.example.com for its subdomains; or *\n");
+            return 1;
+        }
+        /* Rebuild the list without it, then append it when adding */
+        list[0] = '\0';
+        bool found = false;
+        for (const char *p = s_cors; *p; ) {
+            while (*p == ' ') {
+                p++;
+            }
+            const size_t n = strcspn(p, " ");
+            if (n > 0) {
+                if (n == strlen(origin) && strncasecmp(p, origin, n) == 0) {
+                    found = true;
+                } else {
+                    snprintf(list + strlen(list), sizeof(list) - strlen(list), "%s%.*s", list[0] ? " " : "", (int)n, p);
+                }
+            }
+            p += n;
+        }
+        if (!add && !found) {
+            printf("web cors: %s is not on the list\n", origin);
+            return 1;
+        }
+        if (add) {
+            if (strlen(list) + strlen(origin) + 2 > sizeof(list)) {
+                printf("web cors: the list is full (CONFIG_WEB_SERVER_CORS_MAX_LEN)\n");
+                return 1;
+            }
+            snprintf(list + strlen(list), sizeof(list) - strlen(list), "%s%s", list[0] ? " " : "", origin);
+        }
+    } else {
+        printf("usage: web cors [add <origin> | remove <origin> | reset | none]\n");
+        return 1;
+    }
+    const esp_err_t err = nvs_put_str("cors", list);
+    if (err != ESP_OK) {
+        printf("web cors: cannot store it: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    strlcpy(s_cors, list, sizeof(s_cors));
+    print_cors();
+    return 0;
 }
 
 static int web_cmd(int argc, char **argv)
@@ -801,6 +1061,9 @@ static int web_cmd(int argc, char **argv)
                      : "password set: updates and restarts over the web need it\n");
         return 0;
     }
+    if (argc >= 2 && strcmp(argv[1], "cors") == 0) {
+        return cors_cmd(argc - 2, argv + 2);
+    }
     if (argc == 3 && strcmp(argv[1], "hostname") == 0) {
         const bool clear = strcmp(argv[2], "--clear") == 0;
         if (!clear) {
@@ -824,7 +1087,8 @@ static int web_cmd(int argc, char **argv)
         printf("hostname: %s (%s.local now; the router learns it at the next DHCP lease)\n", s_hostname, s_hostname);
         return 0;
     }
-    printf("usage: web [on|off] | web password <password>|--clear | web hostname <name>|--clear\n");
+    printf("usage: web [on|off] | web password <password>|--clear | web hostname <name>|--clear\n"
+           "       web cors [add <origin> | remove <origin> | reset | none]\n");
     return 1;
 }
 
@@ -832,8 +1096,9 @@ void web_server_register_commands(void)
 {
     const esp_console_cmd_t cmd = {
         .command = "web",
-        .help = "The web app and its API: where to reach it; on or off; the password updates need; the board's name",
-        .hint = "[on|off] | password <password>|--clear | hostname <name>|--clear",
+        .help = "The web app and its API: where to reach it; on or off; the password updates need; the board's name; "
+                "which other sites' pages may call the API (CORS)",
+        .hint = "[on|off] | password <password>|--clear | hostname <name>|--clear | cors [add|remove <origin>|reset|none]",
         .func = web_cmd,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));

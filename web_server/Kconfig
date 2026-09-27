@@ -32,4 +32,20 @@ menu "Web server (web_server)"
         help
             A pull runs on a task of its own. TLS wants most of it.
 
+    config WEB_SERVER_CORS_ORIGINS
+        string "Sites whose pages may call the API (CORS), space-separated"
+        default ""
+        help
+            Origins -- scheme://host[:port] -- allowed to call the API from a browser: an API
+            tool such as https://editor.swagger.io, or a project's documentation site.
+            https://*.example.com allows every subdomain of example.com (not example.com
+            itself: list both). `*` allows any site. Empty: none but the board's own pages.
+            `web cors` on the console changes the list, kept in NVS; `web cors reset` comes
+            back to this one. An allowed site can drive the board unless a password is set.
+
+    config WEB_SERVER_CORS_MAX_LEN
+        int "Most characters in the CORS list"
+        default 384
+        range 64 1024
+
 endmenu
