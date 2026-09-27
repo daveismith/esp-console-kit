@@ -1107,8 +1107,7 @@ const char *holo_name(size_t idx)
     return idx < s_count ? s_desc[idx].name : NULL;
 }
 
-/* The parameters within the console's ranges; false with why. */
-static bool motion_in_range(const holo_motion_t *m, char *why, size_t why_len)
+bool holo_motion_check(const holo_motion_t *m, char *why, size_t why_len)
 {
     const int lim = m->kind == HOLO_NUDGE ? 200 : 100;
     if ((m->kind == HOLO_MOVE || m->kind == HOLO_NUDGE) && (abs(m->x) > lim || abs(m->y) > lim)) {
@@ -1138,7 +1137,7 @@ esp_err_t holo_motion(size_t idx, const holo_motion_t *m, char *why, size_t why_
         snprintf(why, why_len, s_task == NULL ? "not started" : "no such holo");
         return ESP_ERR_NOT_FOUND;
     }
-    if (!motion_in_range(m, why, why_len)) {
+    if (!holo_motion_check(m, why, why_len)) {
         return ESP_ERR_INVALID_ARG;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);

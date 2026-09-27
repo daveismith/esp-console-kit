@@ -117,6 +117,9 @@ typedef struct {
  */
 esp_err_t holo_motion(size_t idx, const holo_motion_t *m, char *why, size_t why_len);
 
+/** Whether `m`'s parameters are within range, without starting it: false with `why`. */
+bool holo_motion_check(const holo_motion_t *m, char *why, size_t why_len);
+
 typedef struct {
     const char *name;
     bool ready;                 /**< it could move now */
