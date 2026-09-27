@@ -23,4 +23,24 @@ menu "Console WiFi commands (cmd_wifi)"
             than authentication -- one reconnect is tried every this many seconds while
             WiFi is on, so the board recovers by itself when its access point returns.
 
+    config CMD_WIFI_AP_SSID_PREFIX
+        string "Access point SSID prefix"
+        default "esp"
+        help
+            `wifi ap` names the access point <prefix>-xxxx, xxxx the last two bytes of the
+            station MAC, until `wifi ap --ssid` stores another name.
+
+    config CMD_WIFI_AP_MAX_CONN
+        int "Access point: most stations at once"
+        default 4
+        range 1 10
+
+    config CMD_WIFI_AP_CAPTIVE_DNS
+        bool "Access point: answer every DNS name with the board (captive portal)"
+        default y
+        help
+            A phone that joins the access point checks for internet by fetching a known page;
+            answering every name with the board makes that land on the board's web page, and
+            the phone offers to open it.
+
 endmenu

@@ -31,6 +31,7 @@
 #include "nvs.h"
 #include "cmd_wifi.h"
 #include "wifi_known.h"
+#include "wifi_ap.h"
 
 static const char *TAG = "wifi_known";
 
@@ -702,8 +703,11 @@ static void print_wifi_state(void)
  */
 static int cmd_wifi_power(int argc, char **argv)
 {
+    if (argc >= 2 && strcmp(argv[1], "ap") == 0) {
+        return wifi_ap_command(argc - 1, argv + 1);
+    }
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "on") != 0 && strcmp(argv[1], "off") != 0)) {
-        printf("usage: wifi [on|off]\n");
+        printf("usage: wifi [on|off] | wifi ap [on|off] [--ssid <ssid>] [--pass <passphrase>]\n");
         return 1;
     }
     if (argc == 2) {
@@ -812,8 +816,9 @@ void wifi_known_register_commands(void)
 {
     const esp_console_cmd_t wifi_cmd = {
         .command = "wifi",
-        .help = "WiFi on or off, the stored networks untouched; alone, the link and the default route",
-        .hint = "[on|off]",
+        .help = "WiFi on or off, the stored networks untouched; alone, the link and the default route. "
+                "`wifi ap` runs the board's own access point, on demand",
+        .hint = "[on|off] | ap [on|off] [--ssid <ssid>] [--pass <passphrase>]",
         .func = cmd_wifi_power,
         .argtable = NULL,
     };
