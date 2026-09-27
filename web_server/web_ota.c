@@ -2,8 +2,8 @@
  * web_ota: the /api/v1/ota routes. See web_ota.h, and the OpenAPI description the application
  * serves at /api/v1/openapi.json.
  *
- * An upload runs on a task of its own (an async request), so the server keeps answering --
- * anyone can watch GET /api/v1/ota/image while an image arrives.
+ * An upload is a long operation (web_job_run()): it runs on a task of its own, so the server
+ * keeps answering -- anyone can watch GET /api/v1/ota/image while an image arrives.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -215,13 +215,12 @@ static void upload_run(upload_job_t *job)
     upload_reply(req, err);
 }
 
-static void upload_task(void *arg)
+static void upload_job(httpd_req_t *req, void *ctx)
 {
-    upload_job_t *job = arg;
+    upload_job_t *job = ctx;
+    job->req = req;
     upload_run(job);
-    httpd_req_async_handler_complete(job->req);
     free(job);
-    vTaskDelete(NULL);
 }
 
 static esp_err_t image_put(httpd_req_t *req)
@@ -242,9 +241,14 @@ static esp_err_t image_put(httpd_req_t *req)
     job->reboot = web_query_bool(req, "reboot", false);
     const bool force = web_query_bool(req, "force", false);
 
+    if (!web_job_claim(req, "a firmware upload")) {
+        free(job);
+        return ESP_OK;
+    }
     const esp_err_t err = ota_core_begin(OTA_CORE_SRC_UPLOAD, req->content_len, NULL,
                                          force ? OTA_CORE_ANY_PROJECT : 0);
     if (err != ESP_OK) {
+        web_job_release();
         free(job);
         if (err == ESP_ERR_INVALID_STATE) {
             return web_send_error(req, 409, "busy", "another update is in progress");
@@ -258,20 +262,7 @@ static esp_err_t image_put(httpd_req_t *req)
         ota_core_get(&s);
         return web_send_error(req, 500, "failed", "%s", s.error[0] ? s.error : esp_err_to_name(err));
     }
-
-    httpd_req_t *copy = NULL;
-    if (httpd_req_async_handler_begin(req, &copy) == ESP_OK) {
-        job->req = copy;
-        if (xTaskCreate(upload_task, "ota_upload", CONFIG_WEB_SERVER_UPLOAD_STACK_SIZE, job, 5, NULL) == pdPASS) {
-            return ESP_OK;
-        }
-        httpd_req_async_handler_complete(copy);
-    }
-    /* No task: receive it here, holding up the server until it is done */
-    job->req = req;
-    upload_run(job);
-    free(job);
-    return ESP_OK;
+    return web_job_run(req, upload_job, job);
 }
 
 /* ------------------------------------------------------------------ DELETE /ota/image */

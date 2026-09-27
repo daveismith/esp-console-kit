@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ota_pull.h"
+#include "web_server.h"
 
 static const char *TAG = "ota_pull";
 
@@ -366,6 +367,11 @@ esp_err_t ota_pull_start(const ota_core_pull_req_t *req, char *why, size_t why_l
     if (req->sha256 != NULL && req->sha256[0] != '\0' && strlen(req->sha256) != 64) {
         snprintf(why, why_len, "sha256 is 64 hex digits");
         return ESP_ERR_INVALID_ARG;
+    }
+    const char *running = web_job_running();
+    if (running != NULL) {
+        snprintf(why, why_len, "%s is in progress; try again when it is done", running);
+        return ESP_ERR_INVALID_STATE;
     }
     pull_job_t *job = calloc(1, sizeof(*job));
     if (job == NULL) {

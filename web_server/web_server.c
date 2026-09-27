@@ -3,16 +3,17 @@
  *
  * Protection, for a device on a home network with an optional password:
  *
- *  - Every request that changes something (PUT, POST, DELETE) must name the board in its Host
+ *  - Every request that changes something (PUT, POST, PATCH, DELETE) must name the board in its Host
  *    header -- an IP address, `<hostname>` or `<hostname>.local`. A web page elsewhere that
  *    rebinds its own DNS name to the board's address still sends its own name, so it is
  *    refused.
- *  - A POST must say it carries JSON (Content-Type application/json). A page elsewhere can only
- *    send that -- or a PUT or DELETE at all -- after a CORS preflight, which this server
+ *  - A POST or PATCH must say it carries JSON (Content-Type application/json). A page elsewhere
+ *    can only send that -- or a PUT, PATCH or DELETE at all -- after a CORS preflight, which this server
  *    approves only for the allowlist below, so a page the user happens to visit cannot drive
  *    the board -- even with no password set.
  *  - With a password set (`web password`), routes registered WEB_AUTH also need it, as HTTP
- *    Basic (any user name) or as a Bearer token. Reading is always open.
+ *    Basic (any user name) or as a Bearer token. Reading is open, but for the few GETs that
+ *    read something private (a file, the web settings), which are WEB_AUTH too.
  *  - CORS: pages from the origins on an allowlist -- CONFIG_WEB_SERVER_CORS_ORIGINS, or what
  *    `web cors` stored -- may call the API from a browser (API tools such as Swagger Editor, a
  *    project's own documentation). Their preflights are answered and their replies carry
@@ -52,7 +53,7 @@
 static const char *TAG = "web";
 
 #define NVS_NS "web"
-#define MAX_FEATURES 8
+#define MAX_FEATURES 16
 
 typedef struct {
     char uri[48];
@@ -217,6 +218,47 @@ static bool cors_headers(httpd_req_t *req, cors_t *c)
     return true;
 }
 
+/* An allowlist entry: `*`, or scheme://host[:port] with an optional `*.` before the host. */
+static bool valid_origin(const char *o)
+{
+    if (strcmp(o, "*") == 0) {
+        return true;
+    }
+    const char *s = strstr(o, "://");
+    if (s == NULL || s == o || strlen(o) >= 96) {
+        return false;
+    }
+    for (const char *p = o; p < s; p++) {
+        if (!isalpha((unsigned char)*p)) {
+            return false;
+        }
+    }
+    const char *h = s + 3;
+    if (strncmp(h, "*.", 2) == 0) {
+        h += 2;
+    }
+    if (*h == '\0' || *h == '.' || *h == ':') {
+        return false;
+    }
+    for (; *h; h++) {
+        if (!isalnum((unsigned char)*h) && *h != '.' && *h != '-' && *h != ':') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A hostname: 1-32 letters, digits and inner hyphens. */
+static bool valid_hostname(const char *h)
+{
+    const size_t n = strlen(h);
+    bool ok = n >= 1 && n <= 32 && h[0] != '-' && h[n - 1] != '-';
+    for (size_t i = 0; ok && i < n; i++) {
+        ok = isalnum((unsigned char)h[i]) || h[i] == '-';
+    }
+    return ok;
+}
+
 const char *web_server_hostname(void)
 {
     return s_hostname;
@@ -262,6 +304,7 @@ static const char *status_line(int status)
 {
     switch (status) {
     case 200: return "200 OK";
+    case 201: return "201 Created";
     case 202: return "202 Accepted";
     case 204: return "204 No Content";
     case 302: return "302 Found";
@@ -277,6 +320,7 @@ static const char *status_line(int status)
     case 415: return "415 Unsupported Media Type";
     case 422: return "422 Unprocessable Content";
     case 503: return "503 Service Unavailable";
+    case 507: return "507 Insufficient Storage";
     default:  return "500 Internal Server Error";
     }
 }
@@ -357,6 +401,34 @@ cJSON *web_read_json(httpd_req_t *req, size_t max_len)
     return root;
 }
 
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* A query value as sent (%2F, +) to what it says, cut short to fit. A %00 ends it. */
+static void url_decode(const char *in, char *out, size_t out_len)
+{
+    size_t n = 0;
+    while (*in && n + 1 < out_len) {
+        char c = *in++;
+        if (c == '+') {
+            c = ' ';
+        } else if (c == '%' && hex_value(in[0]) >= 0 && hex_value(in[1]) >= 0) {
+            c = (char)(hex_value(in[0]) << 4 | hex_value(in[1]));
+            in += 2;
+            if (c == '\0') {
+                break;
+            }
+        }
+        out[n++] = c;
+    }
+    out[n] = '\0';
+}
+
 bool web_query(httpd_req_t *req, const char *key, char *out, size_t out_len)
 {
     out[0] = '\0';
@@ -368,24 +440,24 @@ bool web_query(httpd_req_t *req, const char *key, char *out, size_t out_len)
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
         return false;
     }
-    if (httpd_query_key_value(query, key, out, out_len) != ESP_OK) {
-        /* A bare key ("?activate") counts as present and empty */
-        const size_t klen = strlen(key);
-        for (const char *p = query; *p; ) {
-            if (strncmp(p, key, klen) == 0 && (p[klen] == '&' || p[klen] == '\0')) {
-                out[0] = '\0';
-                return true;
-            }
-            p = strchr(p, '&');
-            if (p == NULL) {
-                break;
-            }
-            p++;
-        }
-        out[0] = '\0';
-        return false;
+    char raw[513];
+    if (httpd_query_key_value(query, key, raw, sizeof(raw)) == ESP_OK) {
+        url_decode(raw, out, out_len);
+        return true;
     }
-    return true;
+    /* A bare key ("?activate") counts as present and empty */
+    const size_t klen = strlen(key);
+    for (const char *p = query; *p; ) {
+        if (strncmp(p, key, klen) == 0 && (p[klen] == '&' || p[klen] == '\0')) {
+            return true;
+        }
+        p = strchr(p, '&');
+        if (p == NULL) {
+            break;
+        }
+        p++;
+    }
+    return false;
 }
 
 bool web_query_bool(httpd_req_t *req, const char *key, bool dflt)
@@ -637,19 +709,20 @@ static bool authorised(httpd_req_t *req)
 static esp_err_t dispatch(httpd_req_t *req)
 {
     const route_t *r = req->user_ctx;
-    const bool mutating = req->method == HTTP_POST || req->method == HTTP_PUT || req->method == HTTP_DELETE;
+    const bool mutating = req->method == HTTP_POST || req->method == HTTP_PUT || req->method == HTTP_PATCH ||
+                          req->method == HTTP_DELETE;
     if (mutating) {
         if (!host_is_ours(req)) {
             return web_send_error(req, 403, "forbidden_host",
                                   "the Host header must be the board's address or %s.local", s_hostname);
         }
-        if (req->method == HTTP_POST && !content_type_is(req, "application/json")) {
-            return web_send_error(req, 415, "content_type", "a POST must be Content-Type: application/json");
+        if ((req->method == HTTP_POST || req->method == HTTP_PATCH) && !content_type_is(req, "application/json")) {
+            return web_send_error(req, 415, "content_type", "a POST or PATCH must be Content-Type: application/json");
         }
-        if ((r->flags & WEB_AUTH) && !authorised(req)) {
-            vTaskDelay(pdMS_TO_TICKS(500));     /* a guess at a time */
-            return web_send_error(req, 401, "auth_required", "this needs the board's web password");
-        }
+    }
+    if ((r->flags & WEB_AUTH) && !authorised(req)) {
+        vTaskDelay(pdMS_TO_TICKS(500));     /* a guess at a time */
+        return web_send_error(req, 401, "auth_required", "this needs the board's web password");
     }
     return r->handler(req);
 }
@@ -662,7 +735,7 @@ static esp_err_t preflight(httpd_req_t *req)
         return web_send_error(req, 403, "cors", "this site is not allowed to call the board (`web cors` on its console)");
     }
     httpd_resp_set_status(req, "204 No Content");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Authorization, Content-Type");
     httpd_resp_set_hdr(req, "Access-Control-Max-Age", "600");
     char pna[8];
@@ -720,6 +793,95 @@ void web_server_add_feature(const char *name)
     if (s_n_features < MAX_FEATURES) {
         s_features[s_n_features++] = name;
     }
+}
+
+/* ------------------------------------------------------------------ long operations */
+
+typedef struct {
+    httpd_req_t *req;
+    web_job_fn_t fn;
+    void *ctx;
+} job_t;
+
+static portMUX_TYPE s_job_lock = portMUX_INITIALIZER_UNLOCKED;
+static const char *s_job;       /* what is running, or NULL */
+
+static bool update_running(void)
+{
+    ota_core_session_t s;
+    ota_core_get(&s);
+    return s.state == OTA_CORE_RECEIVING || s.state == OTA_CORE_VERIFYING;
+}
+
+const char *web_job_running(void)
+{
+    return s_job;
+}
+
+void web_job_release(void)
+{
+    taskENTER_CRITICAL(&s_job_lock);
+    s_job = NULL;
+    taskEXIT_CRITICAL(&s_job_lock);
+}
+
+bool web_job_claim(httpd_req_t *req, const char *what)
+{
+    const char *running = NULL;
+    taskENTER_CRITICAL(&s_job_lock);
+    if (s_job != NULL) {
+        running = s_job;
+    } else {
+        s_job = what;
+    }
+    taskEXIT_CRITICAL(&s_job_lock);
+    if (running == NULL && update_running()) {
+        web_job_release();
+        running = "a firmware update";      /* a pull, or `ota put` on the console */
+    }
+    if (running == NULL) {
+        return true;
+    }
+    if (req != NULL) {
+        web_send_error(req, 409, "busy", "%s is in progress; try again when it is done", running);
+    }
+    return false;
+}
+
+static void job_task(void *arg)
+{
+    job_t *job = arg;
+    job->fn(job->req, job->ctx);
+    httpd_req_async_handler_complete(job->req);
+    free(job);
+    web_job_release();
+    vTaskDelete(NULL);
+}
+
+esp_err_t web_job_run(httpd_req_t *req, web_job_fn_t fn, void *ctx)
+{
+    job_t *job = malloc(sizeof(*job));
+    httpd_req_t *copy = NULL;
+    if (job != NULL && httpd_req_async_handler_begin(req, &copy) == ESP_OK) {
+        *job = (job_t){ .req = copy, .fn = fn, .ctx = ctx };
+        if (xTaskCreate(job_task, "web_job", CONFIG_WEB_SERVER_UPLOAD_STACK_SIZE, job, 5, NULL) == pdPASS) {
+            return ESP_OK;
+        }
+        httpd_req_async_handler_complete(copy);
+    }
+    free(job);
+    /* No task: run it here, holding up the server until it is done */
+    fn(req, ctx);
+    web_job_release();
+    return ESP_OK;
+}
+
+esp_err_t web_job_start(httpd_req_t *req, const char *what, web_job_fn_t fn, void *ctx)
+{
+    if (!web_job_claim(req, what)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return web_job_run(req, fn, ctx);
 }
 
 /* ------------------------------------------------------------------ built-in routes */
@@ -818,6 +980,121 @@ static esp_err_t openapi_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* A space-separated list of origins, as a JSON array. */
+static void add_origins(cJSON *arr, const char *list)
+{
+    for (const char *p = list; *p; ) {
+        while (*p == ' ') {
+            p++;
+        }
+        const size_t n = strcspn(p, " ");
+        if (n > 0) {
+            char o[96];
+            snprintf(o, sizeof(o), "%.*s", (int)n, p);
+            cJSON_AddItemToArray(arr, cJSON_CreateString(o));
+        }
+        p += n;
+    }
+}
+
+static cJSON *web_settings_json(void)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "hostname", s_hostname);
+    cJSON_AddBoolToObject(o, "auth", have_password());
+    add_origins(cJSON_AddArrayToObject(o, "cors"), s_cors);
+    add_origins(cJSON_AddArrayToObject(o, "cors_default"), CONFIG_WEB_SERVER_CORS_ORIGINS);
+    return o;
+}
+
+static esp_err_t web_get(httpd_req_t *req)
+{
+    return web_send_json(req, 200, web_settings_json());
+}
+
+/* PATCH /api/v1/web: what `web hostname`, `web password` and `web cors` do, all checked before
+ * any is stored. */
+static esp_err_t web_patch(httpd_req_t *req)
+{
+    cJSON *body = web_read_json(req, 1024);
+    if (body == NULL) {
+        return ESP_OK;
+    }
+    const cJSON *host = cJSON_GetObjectItem(body, "hostname");
+    const cJSON *pw = cJSON_GetObjectItem(body, "password");
+    const cJSON *cors = cJSON_GetObjectItem(body, "cors");
+    char list[sizeof(s_cors)] = "";
+    const char *bad = NULL;
+    for (const cJSON *k = body->child; k != NULL && bad == NULL; k = k->next) {
+        if (strcmp(k->string, "hostname") != 0 && strcmp(k->string, "password") != 0 && strcmp(k->string, "cors") != 0) {
+            bad = "only hostname, password and cors can be changed";
+        }
+    }
+    if (body->child == NULL) {
+        bad = "send hostname, password or cors";
+    }
+    if (bad == NULL && host != NULL && !cJSON_IsNull(host) &&
+        !(cJSON_IsString(host) && valid_hostname(host->valuestring))) {
+        bad = "a hostname is 1-32 letters, digits and inner hyphens, or null for the default";
+    }
+    if (bad == NULL && pw != NULL && !cJSON_IsNull(pw) &&
+        !(cJSON_IsString(pw) && strlen(pw->valuestring) >= 4 && strlen(pw->valuestring) <= 64)) {
+        bad = "a password is 4-64 characters, or null to clear it";
+    }
+    if (bad == NULL && cors != NULL && !cJSON_IsNull(cors)) {
+        if (!cJSON_IsArray(cors)) {
+            bad = "cors is a list of origins, or null for the default";
+        }
+        const cJSON *e;
+        cJSON_ArrayForEach(e, cors) {
+            char origin[96];
+            if (bad != NULL) {
+                break;
+            }
+            if (!cJSON_IsString(e) || strlen(e->valuestring) >= sizeof(origin)) {
+                bad = "an origin is scheme://host[:port], as https://editor.swagger.io";
+                break;
+            }
+            strlcpy(origin, e->valuestring, sizeof(origin));
+            const size_t ol = strlen(origin);
+            if (ol > 0 && origin[ol - 1] == '/') {
+                origin[ol - 1] = '\0';
+            }
+            if (!valid_origin(origin)) {
+                bad = "an origin is scheme://host[:port], as https://editor.swagger.io; https://*.example.com "
+                      "for its subdomains; or *";
+            } else if (strlen(list) + strlen(origin) + 2 > sizeof(list)) {
+                bad = "the list is too long (CONFIG_WEB_SERVER_CORS_MAX_LEN)";
+            } else {
+                snprintf(list + strlen(list), sizeof(list) - strlen(list), "%s%s", list[0] ? " " : "", origin);
+            }
+        }
+    }
+    if (bad != NULL) {
+        cJSON_Delete(body);
+        return web_send_error(req, 400, "bad_request", "%s", bad);
+    }
+
+    esp_err_t err = ESP_OK;
+    if (host != NULL) {
+        err = nvs_put_str("hostname", cJSON_IsNull(host) ? NULL : host->valuestring);
+        load_hostname();
+        apply_hostname();
+    }
+    if (err == ESP_OK && pw != NULL) {
+        err = nvs_put_str("password", cJSON_IsNull(pw) ? NULL : pw->valuestring);
+    }
+    if (err == ESP_OK && cors != NULL) {
+        err = nvs_put_str("cors", cJSON_IsNull(cors) ? NULL : list);
+        load_cors();
+    }
+    cJSON_Delete(body);
+    if (err != ESP_OK) {
+        return web_send_error(req, 500, "failed", "cannot store it: %s", esp_err_to_name(err));
+    }
+    return web_send_json(req, 200, web_settings_json());
+}
+
 /* ------------------------------------------------------------------ server */
 
 static esp_err_t start_httpd(void)
@@ -878,6 +1155,8 @@ esp_err_t web_server_start(const web_server_config_t *cfg)
         web_register("/api/v1/info", HTTP_GET, info_get, 0);
         web_register("/api/v1/restart", HTTP_POST, restart_post, WEB_AUTH);
         web_register("/api/v1/openapi.json", HTTP_GET, openapi_get, 0);
+        web_register("/api/v1/web", HTTP_GET, web_get, WEB_AUTH);
+        web_register("/api/v1/web", HTTP_PATCH, web_patch, WEB_AUTH);
     }
 
     start_mdns();
@@ -907,38 +1186,8 @@ static void print_web(void)
         esp_ip4_addr_t a = { .addr = ap.ip };
         printf("  http://" IPSTR "/  on the access point %s\n", IP2STR(&a), ap.ssid);
     }
-    printf("password: %s\n", have_password() ? "set: changes need it" : "none: anyone on the network can update the board");
+    printf("password: %s\n", have_password() ? "set: changes need it" : "none: anyone on the network can change the board");
     printf("cors: %s\n", s_cors[0] ? s_cors : "none: only the board's own pages call its API from a browser");
-}
-
-/* An allowlist entry: `*`, or scheme://host[:port] with an optional `*.` before the host. */
-static bool valid_origin(const char *o)
-{
-    if (strcmp(o, "*") == 0) {
-        return true;
-    }
-    const char *s = strstr(o, "://");
-    if (s == NULL || s == o || strlen(o) >= 96) {
-        return false;
-    }
-    for (const char *p = o; p < s; p++) {
-        if (!isalpha((unsigned char)*p)) {
-            return false;
-        }
-    }
-    const char *h = s + 3;
-    if (strncmp(h, "*.", 2) == 0) {
-        h += 2;
-    }
-    if (*h == '\0' || *h == '.' || *h == ':') {
-        return false;
-    }
-    for (; *h; h++) {
-        if (!isalnum((unsigned char)*h) && *h != '.' && *h != '-' && *h != ':') {
-            return false;
-        }
-    }
-    return true;
 }
 
 static void print_cors(void)
@@ -1056,7 +1305,7 @@ static int web_cmd(int argc, char **argv)
             return 1;
         }
         printf(clear ? "password cleared: anyone on the network can update the board\n"
-                     : "password set: updates and restarts over the web need it\n");
+                     : "password set: changes over the web need it\n");
         return 0;
     }
     if (argc >= 2 && strcmp(argv[1], "cors") == 0) {
@@ -1064,16 +1313,9 @@ static int web_cmd(int argc, char **argv)
     }
     if (argc == 3 && strcmp(argv[1], "hostname") == 0) {
         const bool clear = strcmp(argv[2], "--clear") == 0;
-        if (!clear) {
-            const size_t n = strlen(argv[2]);
-            bool ok = n >= 1 && n <= 32 && argv[2][0] != '-' && argv[2][n - 1] != '-';
-            for (size_t i = 0; ok && i < n; i++) {
-                ok = isalnum((unsigned char)argv[2][i]) || argv[2][i] == '-';
-            }
-            if (!ok) {
-                printf("web: a hostname is 1-32 letters, digits and inner hyphens\n");
-                return 1;
-            }
+        if (!clear && !valid_hostname(argv[2])) {
+            printf("web: a hostname is 1-32 letters, digits and inner hyphens\n");
+            return 1;
         }
         const esp_err_t err = nvs_put_str("hostname", clear ? NULL : argv[2]);
         if (err != ESP_OK) {

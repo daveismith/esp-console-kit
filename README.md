@@ -11,7 +11,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
 | `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
-| `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, and `/api/v1/ota*` |
+| `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname` `web cors`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, `/api/v1/web`, and `/api/v1/ota*` |
 | `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 
@@ -55,16 +55,21 @@ Notes:
   image by `ota_core_activate()`. `ota_core_set_begin_hook()` lets the application stop what
   flash writes would disturb.
 - `web_server` serves an application's embedded pages (`web_asset_t`, gzipped) and a JSON API.
-  Routes are registered with `web_register()` from any component. Changes (PUT, POST,
-  DELETE) must name the board in `Host` and, for POST, be `application/json`, so other sites'
-  pages can't drive it; `web password` adds a
-  password (Bearer or Basic). Origins on a CORS allowlist (`CONFIG_WEB_SERVER_CORS_ORIGINS`,
+  Routes are registered with `web_register()` from any component. Changes (PUT, POST, PATCH,
+  DELETE) must name the board in `Host` and, for POST and PATCH, be `application/json`, so other
+  sites' pages can't drive it; `web password` (or `PATCH /api/v1/web`) adds a password (Bearer
+  or Basic), which `WEB_AUTH` routes of any method need -- a GET that reads something private
+  too. Query values are URL-decoded. Origins on a CORS allowlist (`CONFIG_WEB_SERVER_CORS_ORIGINS`,
   `https://*.example.com` for subdomains; `web cors` changes it, in NVS) may call the API from a
   browser, preflights answered. mDNS announces `<name>.local`; unknown paths from the access
   point redirect to the page, for phones' captive-portal checks. Needs `espressif/cjson` and
   `espressif/mdns` (managed components).
+  - Long operations -- an upload, download, copy, scan -- run with `web_job_start()` on a task
+    of their own, so the server keeps answering. One at a time, and none during a firmware
+    update: another gets `409 busy`, naming what is running.
+  - `/api/v1/web` reads (with the password) and changes the hostname, password and CORS list.
   - `web_ota_register()` adds the `/api/v1/ota` routes over `ota_core`: upload (PUT,
-    streamed, on its own task), session state, slots, activate, discard, pull, check.
+    streamed, a long operation), session state, slots, activate, discard, pull, check.
   - `ota_pull` downloads an image from a URL or a release manifest (`parts[]` with `role:
     "app"`, `path`, `size`, `sha256`), refusing https-to-http redirects. `ota_pull_set_resolver()`
     lets the application turn channel names (`latest`) into manifest URLs. TLS runs on a task of
