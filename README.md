@@ -10,7 +10,8 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_network` | `register_network_commands()` | `ip addr` `ping` `iperf` `traceroute` `dig` |
 | `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
-| `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
+| `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h`; `fs_ops.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
+| `web_api` | `web_fs_register()` | HTTP: `/api/v1/fs*` (the volume: list, stat, upload, download, move, copy, delete) |
 | `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname` `web cors`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, `/api/v1/web`, and `/api/v1/ota*` |
 | `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
@@ -54,6 +55,13 @@ Notes:
   project on its first 288 bytes, and only a verified image is ever *staged*, then made the boot
   image by `ota_core_activate()`. `ota_core_set_begin_hook()` lets the application stop what
   flash writes would disturb.
+- `fs_ops` is what `fs` does, for other callers: list, stat, make, move, copy, delete and hash,
+  returning errno values, and a writer that goes through `<name>.part` so a failed write never
+  costs the file it replaces. `fs_path()` checks a path from the volume's root (no `..`, names of
+  at most 63 bytes). `fs_ops_set_change_hook()` is told before anything is replaced, moved or
+  deleted -- by `fs` or the API -- so the application can let go of a file it is using.
+- `web_api` puts kit components on the HTTP API, one module at a time: `web_fs_register()` adds
+  `/api/v1/fs` over `fs_ops`; uploads, downloads, copies and hashes are long operations.
 - `web_server` serves an application's embedded pages (`web_asset_t`, gzipped) and a JSON API.
   Routes are registered with `web_register()` from any component. Changes (PUT, POST, PATCH,
   DELETE) must name the board in `Host` and, for POST and PATCH, be `application/json`, so other

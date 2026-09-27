@@ -22,9 +22,9 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "psa/crypto.h"
 #include "sdkconfig.h"
 #include "cmd_fs.h"
+#include "fs_ops.h"
 #include "xfer_session.h"
 #include "xmodem.h"
 
@@ -80,35 +80,6 @@ static double seconds_since(int64_t t0_us)
 static double kib_per_s(size_t bytes, double secs)
 {
     return secs > 0 ? (double)bytes / 1024.0 / secs : 0.0;
-}
-
-static void to_hex(const uint8_t *data, size_t len, char *out)
-{
-    static const char digits[] = "0123456789abcdef";
-    for (size_t i = 0; i < len; i++) {
-        out[2 * i] = digits[data[i] >> 4];
-        out[2 * i + 1] = digits[data[i] & 0x0f];
-    }
-    out[2 * len] = '\0';
-}
-
-/* SHA-256 through PSA, which is all mbedTLS 4 offers; the S3's SHA engine does the work. */
-static bool sha_begin(psa_hash_operation_t *op)
-{
-    *op = psa_hash_operation_init();
-    return psa_crypto_init() == PSA_SUCCESS && psa_hash_setup(op, PSA_ALG_SHA_256) == PSA_SUCCESS;
-}
-
-static bool sha_end(psa_hash_operation_t *op, char hex[65])
-{
-    uint8_t digest[32];
-    size_t len = 0;
-    if (psa_hash_finish(op, digest, sizeof(digest), &len) != PSA_SUCCESS || len != sizeof(digest)) {
-        psa_hash_abort(op);
-        return false;
-    }
-    to_hex(digest, sizeof(digest), hex);
-    return true;
 }
 
 static bool free_space(size_t *out)
@@ -216,20 +187,22 @@ static int fs_simple(const char *op, const char *arg)
         printf("fs: %s: not the volume root\n", op);
         return 1;
     }
-    int rc;
+    /* Removing goes through fs_ops, so whatever uses the file is told first */
+    struct stat st;
+    int err;
     if (strcmp(op, "mkdir") == 0) {
-        rc = mkdir(path, 0775);
+        err = mkdir(path, 0775) == 0 ? 0 : errno;
     } else if (strcmp(op, "rmdir") == 0) {
-        rc = rmdir(path);
+        err = stat(path, &st) != 0 ? errno : !S_ISDIR(st.st_mode) ? ENOTDIR : fs_remove(path, false);
     } else {
-        struct stat st;
         if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
             printf("fs: rm %s: is a directory (use rmdir)\n", path);
             return 1;
         }
-        rc = unlink(path);
+        err = fs_remove(path, false);
     }
-    return rc == 0 ? 0 : fail_errno(op, path);
+    errno = err;
+    return err == 0 ? 0 : fail_errno(op, path);
 }
 
 static int fs_mv(const char *from_arg, const char *to_arg)
@@ -238,12 +211,13 @@ static int fs_mv(const char *from_arg, const char *to_arg)
     if (!resolve(from_arg, from, sizeof(from)) || !resolve(to_arg, to, sizeof(to))) {
         return 1;
     }
-    struct stat st;
-    if (stat(to, &st) == 0) {
+    const int err = fs_move(from, to, false);
+    if (err == EEXIST) {
         printf("fs: mv: %s exists\n", to);
         return 1;
     }
-    return rename(from, to) == 0 ? 0 : fail_errno("mv", from);
+    errno = err;
+    return err == 0 ? 0 : fail_errno("mv", from);
 }
 
 static int fs_cat(const char *arg)
@@ -319,32 +293,13 @@ static int fs_sha256(const char *arg)
     if (!resolve(arg, path, sizeof(path))) {
         return 1;
     }
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return fail_errno("sha256", path);
-    }
-    uint8_t *buf = heap_caps_malloc(IO_CHUNK, MALLOC_CAP_8BIT);
-    psa_hash_operation_t op;
-    if (buf == NULL || !sha_begin(&op)) {
-        printf("fs: sha256: out of memory or no SHA engine\n");
-        free(buf);
-        close(fd);
-        return 1;
-    }
+    struct stat st;
+    const size_t total = stat(path, &st) == 0 ? (size_t)st.st_size : 0;
     const int64_t t0 = esp_timer_get_time();
-    size_t total = 0;
-    ssize_t n;
-    while ((n = read(fd, buf, IO_CHUNK)) > 0) {
-        psa_hash_update(&op, buf, (size_t)n);
-        total += (size_t)n;
-    }
-    const int read_errno = errno;
-    close(fd);
-    free(buf);
     char hex[65];
-    if (n < 0 || !sha_end(&op, hex)) {
-        psa_hash_abort(&op);
-        printf("fs: sha256 %s: %s\n", path, n < 0 ? strerror(read_errno) : "hash failed");
+    const int err = fs_hash(path, hex);
+    if (err != 0) {
+        printf("fs: sha256 %s: %s\n", path, strerror(err));
         return 1;
     }
     const double secs = seconds_since(t0);
@@ -429,24 +384,9 @@ static int fs_bench(int kb)
 /* The session -- the UART taken raw, logging muted, the rate switched -- is xfer_session.c,
  * shared with `ota put`. */
 
-typedef struct {
-    int fd;
-    psa_hash_operation_t sha;
-} put_ctx_t;
-
 static esp_err_t put_sink(void *ctx, const uint8_t *data, size_t len)
 {
-    put_ctx_t *p = ctx;
-    size_t off = 0;
-    while (off < len) {
-        const ssize_t w = write(p->fd, data + off, len - off);
-        if (w <= 0) {
-            return ESP_FAIL;
-        }
-        off += (size_t)w;
-    }
-    psa_hash_update(&p->sha, data, len);
-    return ESP_OK;
+    return fs_write(ctx, data, len) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 static int get_source(void *ctx, uint8_t *buf, size_t len)
@@ -499,7 +439,7 @@ static int fs_put(int argc, char **argv)
     }
     const size_t size = npos > 1 ? (size_t)strtoul(pos[1], NULL, 10) : 0;
 
-    char path[PATH_LEN], part[PATH_LEN + 8];
+    char path[PATH_LEN];
     if (!resolve(pos[0], path, sizeof(path))) {
         return 1;
     }
@@ -525,17 +465,11 @@ static int fs_put(int argc, char **argv)
             return 1;
         }
     }
-    snprintf(part, sizeof(part), "%s.part", path);
-
-    put_ctx_t ctx = { .fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644) };
-    if (ctx.fd < 0) {
-        return fail_errno("put", part);
-    }
-    if (!sha_begin(&ctx.sha)) {
-        printf("fs: put: no SHA engine\n");
-        close(ctx.fd);
-        unlink(part);
-        return 1;
+    fs_writer_t *writer;
+    const int werr = fs_write_begin(path, size, force, &writer);
+    if (werr != 0) {
+        errno = werr;
+        return fail_errno("put", path);
     }
 
     xfer_session_t session;
@@ -550,27 +484,21 @@ static int fs_put(int argc, char **argv)
     const int64_t t0 = esp_timer_get_time();
     if (err == ESP_OK) {
         const xmodem_config_t xcfg = { .expected_size = size };
-        err = xmodem_receive(&session.io, &xcfg, put_sink, &ctx, &stats);
+        err = xmodem_receive(&session.io, &xcfg, put_sink, writer, &stats);
         xfer_session_end(&session);
     }
     const double secs = seconds_since(t0);
 
-    if (close(ctx.fd) != 0 && err == ESP_OK) {
-        err = ESP_FAIL;   /* the last of the data is written on close */
-    }
     char hex[65] = "";
-    const bool hashed = sha_end(&ctx.sha, hex);
     if (err == ESP_OK) {
-        if (exists) {
-            unlink(path);
-        }
-        if (rename(part, path) != 0) {
-            fail_errno("put: rename", part);
-            unlink(part);
-            return 1;
+        /* Into place: a .part file until now, so a failure never costs the file it replaces */
+        const int ferr = fs_write_finish(writer, NULL, hex, NULL);
+        if (ferr != 0) {
+            errno = ferr;
+            return fail_errno("put", path);
         }
     } else {
-        unlink(part);
+        fs_write_abort(writer);
         printf("fs: put failed: %s, after %u bytes (%u retries: %u timed out, %u bad)\n",
                xfer_err(err), (unsigned)stats.bytes, stats.retries, stats.timeouts,
                stats.bad_blocks);
@@ -586,9 +514,7 @@ static int fs_put(int argc, char **argv)
     }
     printf("received %u bytes in %.1f s (%.1f KB/s, %u retries)\n", (unsigned)stats.bytes, secs,
            kib_per_s(stats.bytes, secs), stats.retries);
-    if (hashed) {
-        printf("sha256 %s  %s\n", hex, path);
-    }
+    printf("sha256 %s  %s\n", hex, path);
     return 0;
 }
 
@@ -700,6 +626,7 @@ esp_err_t register_fs(const cmd_fs_config_t *config)
     s_cfg = *config;
     strlcpy(s_base, config->base_path, sizeof(s_base));
     s_cfg.base_path = s_base;
+    fs_ops_init(s_base, config->info, config->info_ctx);
 
     const esp_console_cmd_t cmd = {
         .command = "fs",
