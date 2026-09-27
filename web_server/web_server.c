@@ -1,0 +1,840 @@
+/*
+ * web_server: the board's HTTP server. See web_server.h.
+ *
+ * Protection, for a device on a home network with an optional password:
+ *
+ *  - Every request that changes something (PUT, POST, DELETE) must name the board in its Host
+ *    header -- an IP address, `<hostname>` or `<hostname>.local`. A web page elsewhere that
+ *    rebinds its own DNS name to the board's address still sends its own name, so it is
+ *    refused.
+ *  - A POST must say it carries JSON or an image (Content-Type application/json or
+ *    application/octet-stream). A page elsewhere can only send those after a CORS preflight,
+ *    which this server never approves, so a page the user happens to visit cannot drive the
+ *    board -- even with no password set.
+ *  - With a password set (`web password`), routes registered WEB_AUTH also need it, as HTTP
+ *    Basic (any user name) or as a Bearer token. Reading is always open.
+ *
+ * Unknown paths: an embedded asset if there is one; a JSON 404 under /api; otherwise, for a
+ * request that came in on the access point, a redirect to the board's page -- which is what
+ * makes a phone's connectivity check open it.
+ */
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include "lwip/inet.h"
+#include "esp_app_desc.h"
+#include "esp_chip_info.h"
+#include "esp_console.h"
+#include "esp_heap_caps.h"
+#include "esp_idf_version.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "mdns.h"
+#include "nvs.h"
+#include "sdkconfig.h"
+#include "ota_core.h"
+#include "wifi_ap.h"
+#include "wifi_known.h"
+#include "web_server.h"
+
+static const char *TAG = "web";
+
+#define NVS_NS "web"
+#define MAX_FEATURES 8
+
+typedef struct {
+    char uri[48];
+    httpd_method_t method;
+    web_handler_t handler;
+    unsigned flags;
+    bool live;                  /* registered with the running server */
+} route_t;
+
+static web_server_config_t s_cfg;
+static httpd_handle_t s_server;
+static route_t s_routes[CONFIG_WEB_SERVER_MAX_ROUTES];
+static size_t s_n_routes;
+static const char *s_features[MAX_FEATURES];
+static size_t s_n_features;
+static char s_hostname[33];
+static char s_etag[20];
+static bool s_mdns_up;
+
+/* ------------------------------------------------------------------ settings */
+
+static bool nvs_str(const char *key, char *out, size_t len)
+{
+    nvs_handle_t h;
+    out[0] = '\0';
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    size_t n = len;
+    const bool ok = nvs_get_str(h, key, out, &n) == ESP_OK;
+    nvs_close(h);
+    if (!ok) {
+        out[0] = '\0';
+    }
+    return ok && out[0] != '\0';
+}
+
+static esp_err_t nvs_put_str(const char *key, const char *value)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = value != NULL ? nvs_set_str(h, key, value) : nvs_erase_key(h, key);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+static bool stored_off(void)
+{
+    char v[4];
+    return nvs_str("off", v, sizeof(v)) && v[0] == '1';
+}
+
+static bool have_password(void)
+{
+    char pw[65];
+    return nvs_str("password", pw, sizeof(pw));
+}
+
+const char *web_server_hostname(void)
+{
+    return s_hostname;
+}
+
+static void load_hostname(void)
+{
+    if (!nvs_str("hostname", s_hostname, sizeof(s_hostname))) {
+        wifi_ap_default_name(s_cfg.name_prefix ? s_cfg.name_prefix : "esp", s_hostname, sizeof(s_hostname));
+    }
+}
+
+static void apply_hostname(void)
+{
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta != NULL) {
+        esp_netif_set_hostname(sta, s_hostname);     /* DHCP: from the next lease */
+    }
+    if (s_mdns_up) {
+        mdns_hostname_set(s_hostname);
+    }
+}
+
+static void start_mdns(void)
+{
+    if (s_mdns_up) {
+        return;
+    }
+    if (mdns_init() != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS unavailable");
+        return;
+    }
+    s_mdns_up = true;
+    mdns_hostname_set(s_hostname);
+    mdns_instance_name_set(s_cfg.product ? s_cfg.product : s_hostname);
+    mdns_txt_item_t txt[] = { { "path", "/" }, { "api", "/api/v1" } };
+    mdns_service_add(NULL, "_http", "_tcp", 80, txt, sizeof(txt) / sizeof(txt[0]));
+}
+
+/* ------------------------------------------------------------------ helpers */
+
+static const char *status_line(int status)
+{
+    switch (status) {
+    case 200: return "200 OK";
+    case 202: return "202 Accepted";
+    case 204: return "204 No Content";
+    case 302: return "302 Found";
+    case 304: return "304 Not Modified";
+    case 400: return "400 Bad Request";
+    case 401: return "401 Unauthorized";
+    case 403: return "403 Forbidden";
+    case 404: return "404 Not Found";
+    case 405: return "405 Method Not Allowed";
+    case 409: return "409 Conflict";
+    case 411: return "411 Length Required";
+    case 413: return "413 Content Too Large";
+    case 415: return "415 Unsupported Media Type";
+    case 422: return "422 Unprocessable Content";
+    case 503: return "503 Service Unavailable";
+    default:  return "500 Internal Server Error";
+    }
+}
+
+esp_err_t web_send_json(httpd_req_t *req, int status, cJSON *root)
+{
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (text == NULL) {
+        return httpd_resp_send_500(req);
+    }
+    httpd_resp_set_status(req, status_line(status));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    const esp_err_t err = httpd_resp_sendstr(req, text);
+    cJSON_free(text);
+    return err;
+}
+
+esp_err_t web_send_error(httpd_req_t *req, int status, const char *code, const char *fmt, ...)
+{
+    char message[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(message, sizeof(message), fmt, ap);
+    va_end(ap);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "error", code);
+    cJSON_AddStringToObject(root, "message", message);
+    if (status == 401) {
+        /* Bearer, not Basic: a browser does not pop up its own login box for it */
+        char realm[64];
+        snprintf(realm, sizeof(realm), "Bearer realm=\"%s\"", s_hostname);
+        httpd_resp_set_hdr(req, "WWW-Authenticate", realm);
+        return web_send_json(req, status, root);    /* realm lives until the send */
+    }
+    return web_send_json(req, status, root);
+}
+
+cJSON *web_read_json(httpd_req_t *req, size_t max_len)
+{
+    if (req->content_len == 0) {
+        return cJSON_CreateObject();
+    }
+    if (req->content_len > max_len) {
+        web_send_error(req, 413, "too_large", "the body is over %u bytes", (unsigned)max_len);
+        return NULL;
+    }
+    char *buf = malloc(req->content_len + 1);
+    if (buf == NULL) {
+        httpd_resp_send_500(req);
+        return NULL;
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        const int n = httpd_req_recv(req, buf + got, req->content_len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (n <= 0) {
+            free(buf);
+            return NULL;    /* the connection is gone; nothing to answer */
+        }
+        got += n;
+    }
+    buf[got] = '\0';
+    cJSON *root = cJSON_ParseWithLength(buf, got);
+    free(buf);
+    if (root == NULL || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        web_send_error(req, 400, "bad_json", "the body is not a JSON object");
+        return NULL;
+    }
+    return root;
+}
+
+bool web_query(httpd_req_t *req, const char *key, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    const size_t len = httpd_req_get_url_query_len(req);
+    if (len == 0 || len > 512) {
+        return false;
+    }
+    char query[513];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return false;
+    }
+    if (httpd_query_key_value(query, key, out, out_len) != ESP_OK) {
+        /* A bare key ("?activate") counts as present and empty */
+        const size_t klen = strlen(key);
+        for (const char *p = query; *p; ) {
+            if (strncmp(p, key, klen) == 0 && (p[klen] == '&' || p[klen] == '\0')) {
+                out[0] = '\0';
+                return true;
+            }
+            p = strchr(p, '&');
+            if (p == NULL) {
+                break;
+            }
+            p++;
+        }
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+bool web_query_bool(httpd_req_t *req, const char *key, bool dflt)
+{
+    char v[8];
+    if (!web_query(req, key, v, sizeof(v))) {
+        return dflt;
+    }
+    return v[0] == '\0' || strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0;
+}
+
+static uint32_t local_ipv4(httpd_req_t *req)
+{
+    struct sockaddr_storage addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(httpd_req_to_sockfd(req), (struct sockaddr *)&addr, &len) != 0) {
+        return 0;
+    }
+    if (addr.ss_family == AF_INET) {
+        return ((struct sockaddr_in *)&addr)->sin_addr.s_addr;
+    }
+#if CONFIG_LWIP_IPV6
+    if (addr.ss_family == AF_INET6) {
+        /* An IPv4 client of the dual-stack socket: ::ffff:a.b.c.d */
+        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)&addr;
+        const uint32_t *w = (const uint32_t *)&a6->sin6_addr;
+        if (w[0] == 0 && w[1] == 0 && w[2] == htonl(0xffff)) {
+            return w[3];
+        }
+    }
+#endif
+    return 0;
+}
+
+bool web_req_via_ap(httpd_req_t *req)
+{
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    esp_netif_ip_info_t ip = { 0 };
+    if (ap == NULL || !wifi_ap_is_on() || esp_netif_get_ip_info(ap, &ip) != ESP_OK) {
+        return false;
+    }
+    return ip.ip.addr != 0 && local_ipv4(req) == ip.ip.addr;
+}
+
+cJSON *web_app_desc_json(const esp_app_desc_t *d)
+{
+    cJSON *o = cJSON_CreateObject();
+    char elf[65];
+    for (int i = 0; i < 32; i++) {
+        snprintf(elf + 2 * i, 3, "%02x", d->app_elf_sha256[i]);
+    }
+    cJSON_AddStringToObject(o, "project", d->project_name);
+    cJSON_AddStringToObject(o, "version", d->version);
+    cJSON_AddStringToObject(o, "date", d->date);
+    cJSON_AddStringToObject(o, "time", d->time);
+    cJSON_AddStringToObject(o, "idf", d->idf_ver);
+    cJSON_AddStringToObject(o, "elf_sha256", elf);
+    return o;
+}
+
+/* ------------------------------------------------------------------ assets */
+
+static const web_asset_t *find_asset(const char *path, size_t len)
+{
+    if (len == 1 && path[0] == '/') {
+        path = "/index.html";
+        len = strlen(path);
+    }
+    for (size_t i = 0; i < s_cfg.n_assets; i++) {
+        const web_asset_t *a = &s_cfg.assets[i];
+        if (strlen(a->path) == len && strncmp(a->path, path, len) == 0) {
+            return a;
+        }
+    }
+    return NULL;
+}
+
+static esp_err_t send_asset(httpd_req_t *req, const web_asset_t *a)
+{
+    /* The assets are part of the image: they change exactly when the image does */
+    char tag[24];
+    snprintf(tag, sizeof(tag), "\"%s\"", s_etag);
+    char seen[24];
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", seen, sizeof(seen)) == ESP_OK &&
+        strcmp(seen, tag) == 0) {
+        httpd_resp_set_status(req, "304 Not Modified");
+        httpd_resp_set_hdr(req, "ETag", tag);
+        return httpd_resp_send(req, NULL, 0);
+    }
+    httpd_resp_set_type(req, a->type);
+    httpd_resp_set_hdr(req, "ETag", tag);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    if (a->gzip) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    }
+    return httpd_resp_send(req, (const char *)a->data, a->len);
+}
+
+esp_err_t web_send_asset(httpd_req_t *req, const char *path)
+{
+    const web_asset_t *a = find_asset(path, strlen(path));
+    if (a == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    return send_asset(req, a);
+}
+
+static esp_err_t not_found(httpd_req_t *req, httpd_err_code_t code)
+{
+    (void)code;
+    const char *q = strchr(req->uri, '?');
+    const size_t len = q ? (size_t)(q - req->uri) : strlen(req->uri);
+    if (req->method == HTTP_GET || req->method == HTTP_HEAD) {
+        const web_asset_t *a = find_asset(req->uri, len);
+        if (a != NULL) {
+            return send_asset(req, a);
+        }
+    }
+    if (strncmp(req->uri, "/api/", 5) == 0) {
+        return web_send_error(req, 404, "not_found", "no such endpoint: %.*s", (int)len, req->uri);
+    }
+    if (web_req_via_ap(req)) {
+        /* A phone's connectivity check (generate_204, hotspot-detect.html, ...): send it to the
+         * page, with a body, which iOS needs to decide there is a portal. */
+        esp_netif_ip_info_t ip = { 0 };
+        esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip);
+        char location[32];
+        snprintf(location, sizeof(location), "http://" IPSTR "/", IP2STR(&ip.ip));
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", location);
+        return httpd_resp_sendstr(req, "<a href=\"/\">Holo Player</a>");
+    }
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "not found");
+}
+
+/* ------------------------------------------------------------------ routes */
+
+/* The Host header names the board: an address, or its own name. */
+static bool host_is_ours(httpd_req_t *req)
+{
+    char host[80];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;
+    }
+    if (host[0] == '[') {
+        return true;                            /* an IPv6 literal */
+    }
+    char *colon = strchr(host, ':');
+    if (colon != NULL) {
+        *colon = '\0';
+    }
+    bool dotted = host[0] != '\0';
+    for (const char *p = host; *p; p++) {
+        if (!isdigit((unsigned char)*p) && *p != '.') {
+            dotted = false;
+            break;
+        }
+    }
+    if (dotted) {
+        return true;
+    }
+    const size_t n = strlen(s_hostname);
+    return strncasecmp(host, s_hostname, n) == 0 &&
+           (host[n] == '\0' || strcasecmp(host + n, ".local") == 0);
+}
+
+static bool content_type_is(httpd_req_t *req, const char *type)
+{
+    char ct[64];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK) {
+        return false;
+    }
+    return strncasecmp(ct, type, strlen(type)) == 0;
+}
+
+static int b64_value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static size_t b64_decode(const char *in, char *out, size_t out_len)
+{
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t n = 0;
+    for (; *in && *in != '='; in++) {
+        const int v = b64_value(*in);
+        if (v < 0) {
+            return 0;
+        }
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (n + 1 >= out_len) {
+                return 0;
+            }
+            out[n++] = (char)((acc >> bits) & 0xff);
+        }
+    }
+    out[n] = '\0';
+    return n;
+}
+
+/* Compare without stopping at the first difference */
+static bool same_secret(const char *a, const char *b)
+{
+    const size_t la = strlen(a), lb = strlen(b);
+    unsigned diff = la ^ lb;
+    for (size_t i = 0; i < la; i++) {
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[lb ? i % lb : 0];
+    }
+    return diff == 0;
+}
+
+static bool authorised(httpd_req_t *req)
+{
+    char pw[65];
+    if (!nvs_str("password", pw, sizeof(pw))) {
+        return true;
+    }
+    char hdr[160];
+    bool ok = false;
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) == ESP_OK) {
+        if (strncasecmp(hdr, "Bearer ", 7) == 0) {
+            ok = same_secret(hdr + 7, pw);
+        } else if (strncasecmp(hdr, "Basic ", 6) == 0) {
+            char plain[120];
+            if (b64_decode(hdr + 6, plain, sizeof(plain)) > 0) {
+                const char *colon = strchr(plain, ':');
+                ok = colon != NULL && same_secret(colon + 1, pw);
+            }
+        }
+    }
+    memset(pw, 0, sizeof(pw));
+    return ok;
+}
+
+static esp_err_t dispatch(httpd_req_t *req)
+{
+    const route_t *r = req->user_ctx;
+    const bool mutating = req->method == HTTP_POST || req->method == HTTP_PUT || req->method == HTTP_DELETE;
+    if (mutating) {
+        if (!host_is_ours(req)) {
+            return web_send_error(req, 403, "forbidden_host",
+                                  "the Host header must be the board's address or %s.local", s_hostname);
+        }
+        if (req->method == HTTP_POST && !content_type_is(req, "application/json") &&
+            !content_type_is(req, "application/octet-stream")) {
+            return web_send_error(req, 415, "content_type",
+                                  "a POST must be Content-Type: application/json (or application/octet-stream for an image)");
+        }
+        if ((r->flags & WEB_AUTH) && !authorised(req)) {
+            vTaskDelay(pdMS_TO_TICKS(500));     /* a guess at a time */
+            return web_send_error(req, 401, "auth_required", "this needs the board's web password");
+        }
+    }
+    return r->handler(req);
+}
+
+static esp_err_t register_live(route_t *r)
+{
+    const httpd_uri_t uri = { .uri = r->uri, .method = r->method, .handler = dispatch, .user_ctx = r };
+    const esp_err_t err = httpd_register_uri_handler(s_server, &uri);
+    r->live = err == ESP_OK;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: %s", r->uri, esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t web_register(const char *uri, httpd_method_t method, web_handler_t handler, unsigned flags)
+{
+    if (s_n_routes >= CONFIG_WEB_SERVER_MAX_ROUTES || strlen(uri) >= sizeof(s_routes[0].uri)) {
+        ESP_LOGE(TAG, "no room for route %s (CONFIG_WEB_SERVER_MAX_ROUTES)", uri);
+        return ESP_ERR_NO_MEM;
+    }
+    route_t *r = &s_routes[s_n_routes++];
+    strlcpy(r->uri, uri, sizeof(r->uri));
+    r->method = method;
+    r->handler = handler;
+    r->flags = flags;
+    return s_server != NULL ? register_live(r) : ESP_OK;
+}
+
+void web_server_add_feature(const char *name)
+{
+    if (s_n_features < MAX_FEATURES) {
+        s_features[s_n_features++] = name;
+    }
+}
+
+/* ------------------------------------------------------------------ built-in routes */
+
+static void add_ip(cJSON *o, const char *key, esp_ip4_addr_t ip)
+{
+    char s[16];
+    snprintf(s, sizeof(s), IPSTR, IP2STR(&ip));
+    cJSON_AddStringToObject(o, key, s);
+}
+
+static esp_err_t info_get(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "api", 1);
+    cJSON_AddItemToObject(root, "firmware", web_app_desc_json(esp_app_get_description()));
+    cJSON_AddStringToObject(root, "chip", CONFIG_IDF_TARGET);
+    cJSON_AddStringToObject(root, "hostname", s_hostname);
+    cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
+    cJSON_AddNumberToObject(root, "heap_free", (double)esp_get_free_heap_size());
+    cJSON *features = cJSON_AddArrayToObject(root, "features");
+    for (size_t i = 0; i < s_n_features; i++) {
+        cJSON_AddItemToArray(features, cJSON_CreateString(s_features[i]));
+    }
+    cJSON_AddBoolToObject(root, "auth", have_password());
+    cJSON_AddStringToObject(root, "via", web_req_via_ap(req) ? "ap" : "sta");
+
+    cJSON *sta = cJSON_AddObjectToObject(root, "sta");
+    cJSON_AddBoolToObject(sta, "enabled", wifi_known_is_enabled());
+    esp_netif_t *sn = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    wifi_ap_record_t rec;
+    const bool linked = sn != NULL && esp_netif_is_netif_up(sn) && esp_wifi_sta_get_ap_info(&rec) == ESP_OK;
+    cJSON_AddBoolToObject(sta, "connected", linked);
+    if (linked) {
+        esp_netif_ip_info_t ip = { 0 };
+        esp_netif_get_ip_info(sn, &ip);
+        cJSON_AddStringToObject(sta, "ssid", (const char *)rec.ssid);
+        add_ip(sta, "ip", ip.ip);
+        cJSON_AddNumberToObject(sta, "rssi", rec.rssi);
+        cJSON_AddNumberToObject(sta, "channel", rec.primary);
+#if CONFIG_LWIP_IPV6
+        cJSON *v6 = cJSON_AddArrayToObject(sta, "ipv6");
+        esp_ip6_addr_t addrs[CONFIG_LWIP_IPV6_NUM_ADDRESSES];
+        const int n = esp_netif_get_all_ip6(sn, addrs);
+        for (int i = 0; i < n; i++) {
+            char s[48];
+            if (inet_ntop(AF_INET6, addrs[i].addr, s, sizeof(s)) == NULL) {
+                continue;
+            }
+            for (char *p = s; *p; p++) {
+                *p = tolower((unsigned char)*p);     /* RFC 5952; lwIP writes capitals */
+            }
+            cJSON_AddItemToArray(v6, cJSON_CreateString(s));
+        }
+#endif
+    }
+
+    wifi_ap_info_t ap;
+    wifi_ap_get_info(&ap);
+    cJSON *apo = cJSON_AddObjectToObject(root, "ap");
+    cJSON_AddBoolToObject(apo, "on", ap.on);
+    if (ap.on) {
+        cJSON_AddStringToObject(apo, "ssid", ap.ssid);
+        add_ip(apo, "ip", (esp_ip4_addr_t){ .addr = ap.ip });
+        cJSON_AddNumberToObject(apo, "clients", ap.clients);
+    }
+    return web_send_json(req, 200, root);
+}
+
+static esp_err_t restart_post(httpd_req_t *req)
+{
+    cJSON *body = web_read_json(req, 256);
+    if (body == NULL) {
+        return ESP_OK;
+    }
+    const cJSON *d = cJSON_GetObjectItem(body, "delay_ms");
+    uint32_t delay = cJSON_IsNumber(d) && d->valuedouble >= 0 ? (uint32_t)d->valuedouble : 500;
+    cJSON_Delete(body);
+    if (delay < 200) {
+        delay = 200;        /* long enough for this reply to leave */
+    }
+    if (delay > 60000) {
+        delay = 60000;
+    }
+    ota_core_restart_after(delay);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "restart_in_ms", delay);
+    return web_send_json(req, 202, root);
+}
+
+static esp_err_t openapi_get(httpd_req_t *req)
+{
+    if (web_send_asset(req, "/openapi.json") == ESP_ERR_NOT_FOUND) {
+        return web_send_error(req, 404, "not_found", "this firmware carries no API description");
+    }
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ server */
+
+static esp_err_t start_httpd(void)
+{
+    if (s_server != NULL) {
+        return ESP_OK;
+    }
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = CONFIG_WEB_SERVER_STACK_SIZE;
+    config.max_uri_handlers = CONFIG_WEB_SERVER_MAX_ROUTES;
+    config.max_open_sockets = CONFIG_WEB_SERVER_MAX_SOCKETS;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    esp_err_t err = httpd_start(&s_server, &config);
+    if (err != ESP_OK) {
+        s_server = NULL;
+        return err;
+    }
+    httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, not_found);
+    for (size_t i = 0; i < s_n_routes; i++) {
+        register_live(&s_routes[i]);
+    }
+    ESP_LOGI(TAG, "serving http://%s.local/ (%u routes, %u pages)", s_hostname, (unsigned)s_n_routes,
+             (unsigned)s_cfg.n_assets);
+    return ESP_OK;
+}
+
+static void stop_httpd(void)
+{
+    if (s_server != NULL) {
+        httpd_stop(s_server);
+        s_server = NULL;
+        for (size_t i = 0; i < s_n_routes; i++) {
+            s_routes[i].live = false;
+        }
+    }
+}
+
+bool web_server_running(void)
+{
+    return s_server != NULL;
+}
+
+esp_err_t web_server_start(const web_server_config_t *cfg)
+{
+    s_cfg = *cfg;
+    char elf[17];
+    esp_app_get_elf_sha256(elf, sizeof(elf));
+    strlcpy(s_etag, elf, sizeof(s_etag));
+    load_hostname();
+
+    static bool builtins;
+    if (!builtins) {
+        builtins = true;
+        web_register("/api/v1/info", HTTP_GET, info_get, 0);
+        web_register("/api/v1/restart", HTTP_POST, restart_post, WEB_AUTH);
+        web_register("/api/v1/openapi.json", HTTP_GET, openapi_get, 0);
+    }
+
+    start_mdns();
+    apply_hostname();
+    if (stored_off()) {
+        ESP_LOGI(TAG, "off (`web on` starts it)");
+        return ESP_OK;
+    }
+    return start_httpd();
+}
+
+/* ------------------------------------------------------------------ console */
+
+static void print_web(void)
+{
+    printf("web: %s\n", s_server != NULL ? "on" : stored_off() ? "off, until `web on`" : "off");
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip = { 0 };
+    if (sta != NULL && esp_netif_is_netif_up(sta) && esp_netif_get_ip_info(sta, &ip) == ESP_OK &&
+        ip.ip.addr != 0) {
+        printf("  http://" IPSTR "/\n", IP2STR(&ip.ip));
+    }
+    printf("  http://%s.local/%s\n", s_hostname, s_mdns_up ? "" : "  (mDNS unavailable)");
+    wifi_ap_info_t ap;
+    wifi_ap_get_info(&ap);
+    if (ap.on) {
+        esp_ip4_addr_t a = { .addr = ap.ip };
+        printf("  http://" IPSTR "/  on the access point %s\n", IP2STR(&a), ap.ssid);
+    }
+    printf("password: %s\n", have_password() ? "set: changes need it" : "none: anyone on the network can update the board");
+}
+
+static int web_cmd(int argc, char **argv)
+{
+    if (argc == 1) {
+        print_web();
+        return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "off") == 0)) {
+        const bool on = strcmp(argv[1], "on") == 0;
+        nvs_put_str("off", on ? NULL : "1");
+        if (on) {
+            const esp_err_t err = start_httpd();
+            if (err != ESP_OK) {
+                printf("web: cannot start: %s\n", esp_err_to_name(err));
+                return 1;
+            }
+        } else {
+            stop_httpd();
+        }
+        print_web();
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "password") == 0) {
+        const bool clear = strcmp(argv[2], "--clear") == 0;
+        if (!clear && (strlen(argv[2]) < 4 || strlen(argv[2]) > 64)) {
+            printf("web: a password is 4-64 characters\n");
+            return 1;
+        }
+        const esp_err_t err = nvs_put_str("password", clear ? NULL : argv[2]);
+        if (err != ESP_OK) {
+            printf("web: cannot store it: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf(clear ? "password cleared: anyone on the network can update the board\n"
+                     : "password set: updates and restarts over the web need it\n");
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "hostname") == 0) {
+        const bool clear = strcmp(argv[2], "--clear") == 0;
+        if (!clear) {
+            const size_t n = strlen(argv[2]);
+            bool ok = n >= 1 && n <= 32 && argv[2][0] != '-' && argv[2][n - 1] != '-';
+            for (size_t i = 0; ok && i < n; i++) {
+                ok = isalnum((unsigned char)argv[2][i]) || argv[2][i] == '-';
+            }
+            if (!ok) {
+                printf("web: a hostname is 1-32 letters, digits and inner hyphens\n");
+                return 1;
+            }
+        }
+        const esp_err_t err = nvs_put_str("hostname", clear ? NULL : argv[2]);
+        if (err != ESP_OK) {
+            printf("web: cannot store it: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        load_hostname();
+        apply_hostname();
+        printf("hostname: %s (%s.local now; the router learns it at the next DHCP lease)\n", s_hostname, s_hostname);
+        return 0;
+    }
+    printf("usage: web [on|off] | web password <password>|--clear | web hostname <name>|--clear\n");
+    return 1;
+}
+
+void web_server_register_commands(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "web",
+        .help = "The web app and its API: where to reach it; on or off; the password updates need; the board's name",
+        .hint = "[on|off] | password <password>|--clear | hostname <name>|--clear",
+        .func = web_cmd,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}

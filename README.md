@@ -6,11 +6,12 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | Component | Register with | Commands |
 |---|---|---|
 | `cmd_system` | `register_system_common()`, `register_gpio(table, n)`, `register_system_deep_sleep()`, `register_system_light_sleep()` | `version` `restart` `free` `heap` `membench` `flash-stats` `tasks` `top` `log_level` `gpio` `deep_sleep` `light_sleep` |
-| `cmd_wifi` | `register_wifi()`, `wifi_known_register_commands()` + `wifi_known_start()` | `join` `wifi_txpower` `wifi_link` `wifi_ps`, and saved networks: `wifi [on\|off]` `wifi_save` `wifi_forget` `wifi_known` |
+| `cmd_wifi` | `register_wifi()`, `wifi_known_register_commands()` + `wifi_known_start()`; `wifi_ap_start()`/`wifi_ap_stop()` | `join` `wifi_txpower` `wifi_link` `wifi_ps`, and saved networks: `wifi [on\|off]` `wifi_save` `wifi_forget` `wifi_known`; the access point: `wifi ap [on\|off] [--ssid] [--pass]` |
 | `cmd_network` | `register_network_commands()` | `ip addr` `ping` `iperf` `traceroute` `dig` |
 | `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
-| `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots) and `ota put` (a new image over XMODEM-1K) |
+| `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
+| `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, and `/api/v1/ota*` |
 | `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 
@@ -48,6 +49,28 @@ Notes:
     previous image.
   - `ota` lists the slots, their versions and states. `ota put -d` is a link test that
     writes nothing.
+- `ota_core` is the update session every transport shares: `ota put`, an HTTP upload, a pull.
+  One at a time; it writes the slot that isn't running, checks an image's header, chip and
+  project on its first 288 bytes, and only a verified image is ever *staged*, then made the boot
+  image by `ota_core_activate()`. `ota_core_set_begin_hook()` lets the application stop what
+  flash writes would disturb.
+- `web_server` serves an application's embedded pages (`web_asset_t`, gzipped) and a JSON API.
+  Routes are registered with `web_register()` from any component. Changes (PUT, POST,
+  DELETE) must name the board in `Host` and, for POST, be `application/json` or
+  `application/octet-stream`, so other sites' pages can't drive it; `web password` adds a
+  password (Bearer or Basic). mDNS announces `<name>.local`; unknown paths from the access
+  point redirect to the page, for phones' captive-portal checks. Needs `espressif/cjson` and
+  `espressif/mdns` (managed components).
+  - `web_ota_register()` adds the `/api/v1/ota` routes over `ota_core`: upload (PUT/POST,
+    streamed, on its own task), session state, slots, activate, discard, pull, check.
+  - `ota_pull` downloads an image from a URL or a release manifest (`parts[]` with `role:
+    "app"`, `path`, `size`, `sha256`), refusing https-to-http redirects. `ota_pull_set_resolver()`
+    lets the application turn channel names (`latest`) into manifest URLs. TLS runs on a task of
+    `CONFIG_WEB_SERVER_PULL_STACK_SIZE`, never on the server's.
+- `wifi_ap` runs the board's own access point, on demand and never persisted: WPA2 with a random
+  passphrase kept in NVS (the MAC is the BSSID, so it would be a poor secret), DHCP offering the
+  board as DNS and captive portal, and a small DNS responder answering every name with the board.
+  `CONFIG_CMD_WIFI_AP_SSID_PREFIX` names it `<prefix>-xxxx`.
 - `servo` drives hobby servos on PCA9685 boards over I2C, or on the chip's own pins
   with MCPWM (one timer each, so six on an S3).
   - Each servo has an absolute pulse range it is never driven outside, and a working

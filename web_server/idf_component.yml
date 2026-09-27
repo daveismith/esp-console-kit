@@ -1,0 +1,7 @@
+version: "0.1.0"
+description: "HTTP server for a device's web app and JSON API (/api/v1), with application updates over HTTP (upload, pull from a URL or release channel), mDNS, an optional password, and the `web` console command"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"
+  espressif/cjson: "^1.7.19"
+  espressif/mdns: "^1.8.0"

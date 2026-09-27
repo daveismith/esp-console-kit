@@ -1,0 +1,35 @@
+menu "Web server (web_server)"
+
+    config WEB_SERVER_MAX_ROUTES
+        int "Most API routes"
+        default 24
+        range 8 64
+        help
+            Routes registered with web_register(), the built-in ones included. Pages are
+            served without a route each.
+
+    config WEB_SERVER_MAX_SOCKETS
+        int "Most open connections"
+        default 7
+        range 3 13
+        help
+            The server keeps three more sockets for itself: CONFIG_LWIP_MAX_SOCKETS must
+            cover these, those three, and everything else the application opens.
+
+    config WEB_SERVER_STACK_SIZE
+        int "Server task stack"
+        default 6144
+
+    config WEB_SERVER_UPLOAD_STACK_SIZE
+        int "Upload task stack"
+        default 6144
+        help
+            An image upload runs on a task of its own, so the server keeps answering.
+
+    config WEB_SERVER_PULL_STACK_SIZE
+        int "Download task stack"
+        default 8192
+        help
+            A pull runs on a task of its own. TLS wants most of it.
+
+endmenu
