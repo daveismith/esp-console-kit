@@ -46,6 +46,7 @@
 #include "mdns.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+#include "api_core.h"
 #include "ota_core.h"
 #include "wifi_ap.h"
 #include "wifi_known.h"
@@ -934,7 +935,7 @@ cJSON *web_sta_json(void)
     return sta;
 }
 
-static esp_err_t info_get(httpd_req_t *req)
+static api_reply_t info_route(const api_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "api", 1);
@@ -948,7 +949,7 @@ static esp_err_t info_get(httpd_req_t *req)
         cJSON_AddItemToArray(features, cJSON_CreateString(s_features[i]));
     }
     cJSON_AddBoolToObject(root, "auth", have_password());
-    cJSON_AddStringToObject(root, "via", web_req_via_ap(req) ? "ap" : "sta");
+    cJSON_AddStringToObject(root, "via", req->via);
 
     cJSON_AddItemToObject(root, "sta", web_sta_json());
 
@@ -964,18 +965,13 @@ static esp_err_t info_get(httpd_req_t *req)
             cJSON_AddNumberToObject(apo, "off_in_s", ap.off_in_s);
         }
     }
-    return web_send_json(req, 200, root);
+    return api_json(200, root);
 }
 
-static esp_err_t restart_post(httpd_req_t *req)
+static api_reply_t restart_route(const api_req_t *req)
 {
-    cJSON *body = web_read_json(req, 256);
-    if (body == NULL) {
-        return ESP_OK;
-    }
-    const cJSON *d = cJSON_GetObjectItem(body, "delay_ms");
+    const cJSON *d = cJSON_GetObjectItem(req->body, "delay_ms");
     uint32_t delay = cJSON_IsNumber(d) && d->valuedouble >= 0 ? (uint32_t)d->valuedouble : 500;
-    cJSON_Delete(body);
     if (delay < 200) {
         delay = 200;        /* long enough for this reply to leave */
     }
@@ -985,7 +981,70 @@ static esp_err_t restart_post(httpd_req_t *req)
     ota_core_restart_after(delay);
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "restart_in_ms", delay);
-    return web_send_json(req, 202, root);
+    return api_json(202, root);
+}
+
+/* ------------------------------------------------------------------ api_core routes over HTTP */
+
+static const api_route_t s_core_routes[] = {
+    API_ROUTE(API_GET, "/api/v1/info", info_route, 0, API_LINK),
+    API_ROUTE(API_POST, "/api/v1/restart", restart_route, 256, API_LINK),
+};
+
+static const httpd_method_t HTTP_OF[] = { HTTP_GET, HTTP_PUT, HTTP_POST, HTTP_PATCH, HTTP_DELETE };
+
+static bool api_method_from(int m, api_method_t *out)
+{
+    for (size_t i = 0; i < sizeof(HTTP_OF) / sizeof(HTTP_OF[0]); i++) {
+        if ((int)HTTP_OF[i] == m) {
+            *out = (api_method_t)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Every api_core route: the request as api_core's, and its reply sent. */
+static esp_err_t api_handler(httpd_req_t *req)
+{
+    const char *q = strchr(req->uri, '?');
+    char path[64];
+    snprintf(path, sizeof(path), "%.*s", (int)(q ? (size_t)(q - req->uri) : strlen(req->uri)), req->uri);
+    api_method_t m;
+    const api_route_t *r = api_method_from(req->method, &m) ? api_find(m, path, NULL) : NULL;
+    if (r == NULL) {
+        return web_send_error(req, 404, "not_found", "no such endpoint: %s", path);
+    }
+    cJSON *body = r->body_max > 0 ? web_read_json(req, r->body_max) : cJSON_CreateObject();
+    if (body == NULL) {
+        return ESP_OK;      /* the error is sent */
+    }
+    char *query = NULL;
+    const size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0 && (query = malloc(qlen + 1)) != NULL &&
+        httpd_req_get_url_query_str(req, query, qlen + 1) != ESP_OK) {
+        query[0] = '\0';
+    }
+    const api_req_t areq = { .query = query, .body = body, .via = web_req_via_ap(req) ? "ap" : "sta" };
+    const api_reply_t reply = r->fn(&areq);
+    cJSON_Delete(body);
+    free(query);
+    if (reply.body == NULL) {
+        httpd_resp_set_status(req, reply.status == 204 ? "204 No Content" : "500 Internal Server Error");
+        cors_t cors;
+        cors_headers(req, &cors);
+        return httpd_resp_send(req, NULL, 0);
+    }
+    return web_send_json(req, reply.status, reply.body);
+}
+
+static void serve_route(const api_route_t *r)
+{
+    if (r->flags & API_NO_HTTP) {
+        return;
+    }
+    const unsigned flags = r->method != API_GET || (r->flags & API_PRIVATE) ? WEB_AUTH : 0;
+    web_register(r->path, HTTP_OF[r->method], api_handler, flags);
 }
 
 static esp_err_t openapi_get(httpd_req_t *req)
@@ -1184,8 +1243,8 @@ esp_err_t web_server_start(const web_server_config_t *cfg)
     static bool builtins;
     if (!builtins) {
         builtins = true;
-        web_register("/api/v1/info", HTTP_GET, info_get, 0);
-        web_register("/api/v1/restart", HTTP_POST, restart_post, WEB_AUTH);
+        api_watch_routes(serve_route);
+        api_add_routes(s_core_routes, sizeof(s_core_routes) / sizeof(s_core_routes[0]));
         web_register("/api/v1/openapi.json", HTTP_GET, openapi_get, 0);
         web_register("/api/v1/web", HTTP_GET, web_get, WEB_AUTH);
         web_register("/api/v1/web", HTTP_PATCH, web_patch, WEB_AUTH);
