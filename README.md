@@ -12,7 +12,8 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
 | `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h`; `fs_ops.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
 | `web_api` | `web_fs_register()`, `web_servo_register(before_move)`, `web_net_register()` | HTTP: `/api/v1/fs*` (the volume: list, stat, upload, download, move, copy, delete); `/api/v1/servos*` (positions, moves, calibration, drive policy); `/api/v1/network*` (the link, known networks, scan, join, the access point) |
-| `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname` `web cors`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, `/api/v1/web`, and `/api/v1/ota*` |
+| `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname` `web cors`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, `/api/v1/web`, `/api/v1/events`, and `/api/v1/ota*` |
+| `events` | `events_declare()`, `events_changed()`, `events_happened()`; `events_listen()` | none: what changed, for the web server's event stream and any other listener |
 | `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()`; `holo_motion()`, `holo_status()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 
@@ -76,12 +77,24 @@ Notes:
     of their own, so the server keeps answering. One at a time, and none during a firmware
     update: another gets `409 busy`, naming what is running.
   - `/api/v1/web` reads (with the password) and changes the hostname, password and CORS list.
+  - `/api/v1/events` streams the `events` component as Server-Sent Events: the handler answers
+    with its own head and keeps the socket, and events are written to it later from the
+    server's task (`httpd_queue_work()`), without waiting: a client that can't take them is
+    closed, and its `EventSource` comes back. `CONFIG_WEB_SERVER_MAX_STREAMS` (3) at once; a
+    heartbeat every 15 s. Without `Accept: text/event-stream`, the kept happenings as JSON.
   - `web_ota_register()` adds the `/api/v1/ota` routes over `ota_core`: upload (PUT,
     streamed, a long operation), session state, slots, activate, discard, pull, check.
   - `ota_pull` downloads an image from a URL or a release manifest (`parts[]` with `role:
     "app"`, `path`, `size`, `sha256`), refusing https-to-http redirects. `ota_pull_set_resolver()`
     lets the application turn channel names (`latest`) into manifest URLs. TLS runs on a task of
     `CONFIG_WEB_SERVER_PULL_STACK_SIZE`, never on the server's.
+- `events` is what changed on the board, with nothing HTTP in it. A *state* kind (a resource) is
+  declared with a builder, the JSON its GET returns, and its owner calls `events_changed()`: a
+  listener is only marked, and builds the latest state when it sends, so a burst is one event. A
+  *happening* (`events_happened()`) is numbered (`seq`), stamped and kept, the last 32, so a
+  listener can catch up with `events_since()`. `web_server` streams them; `web_ota` publishes the
+  update session (`ota`), `web_net` the network (`network`), and the web server `system` (uptime,
+  memory, signal) every 15 s.
 - `wifi_known` also lists the stored networks (`wifi_known_list()`), stores one without joining
   (`wifi_known_save()`), and scans (`wifi_known_scan()`, and `wifi scan` on the console).
 - `wifi_known_is_connected()`: whether the station has an address.

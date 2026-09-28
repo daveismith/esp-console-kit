@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include "lwip/inet.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -48,6 +49,7 @@
 #include "ota_core.h"
 #include "wifi_ap.h"
 #include "wifi_known.h"
+#include "web_internal.h"
 #include "web_server.h"
 
 static const char *TAG = "web";
@@ -206,6 +208,11 @@ static bool origin_allowed(const char *origin)
 typedef struct {
     char origin[128];
 } cors_t;
+
+bool web_cors_origin(httpd_req_t *req, char *out, size_t len)
+{
+    return httpd_req_get_hdr_value_str(req, "Origin", out, len) == ESP_OK && origin_allowed(out);
+}
 
 static bool cors_headers(httpd_req_t *req, cors_t *c)
 {
@@ -1106,6 +1113,19 @@ static esp_err_t web_patch(httpd_req_t *req)
 
 /* ------------------------------------------------------------------ server */
 
+httpd_handle_t web_server_handle(void)
+{
+    return s_server;
+}
+
+/* Every connection that closes: an event stream may have been on it. */
+static void closed(httpd_handle_t hd, int fd)
+{
+    (void)hd;
+    web_events_closed(fd);
+    close(fd);
+}
+
 static esp_err_t start_httpd(void)
 {
     if (s_server != NULL) {
@@ -1118,12 +1138,14 @@ static esp_err_t start_httpd(void)
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
+    config.close_fn = closed;
     esp_err_t err = httpd_start(&s_server, &config);
     if (err != ESP_OK) {
         s_server = NULL;
         return err;
     }
     httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, not_found);
+    web_events_started();
     for (size_t i = 0; i < s_n_routes; i++) {
         register_live(&s_routes[i]);
     }
@@ -1135,6 +1157,7 @@ static esp_err_t start_httpd(void)
 static void stop_httpd(void)
 {
     if (s_server != NULL) {
+        web_events_stopped();
         httpd_stop(s_server);
         s_server = NULL;
         for (size_t i = 0; i < s_n_routes; i++) {
@@ -1166,6 +1189,8 @@ esp_err_t web_server_start(const web_server_config_t *cfg)
         web_register("/api/v1/openapi.json", HTTP_GET, openapi_get, 0);
         web_register("/api/v1/web", HTTP_GET, web_get, WEB_AUTH);
         web_register("/api/v1/web", HTTP_PATCH, web_patch, WEB_AUTH);
+        web_register("/api/v1/events", HTTP_GET, web_events_get, 0);
+        web_events_init();
     }
 
     start_mdns();

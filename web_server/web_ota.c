@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+#include "events.h"
 #include "ota_core.h"
 #include "ota_pull.h"
 #include "web_ota.h"
@@ -513,11 +514,45 @@ static esp_err_t check_get(httpd_req_t *req)
     return web_send_json(req, 200, root);
 }
 
+/* ------------------------------------------------------------------ events */
+
+/* The session, looked at every second while someone is following `ota`: the state, and the bytes
+ * as they arrive, at most once a second. */
+static void watch_session(void *arg)
+{
+    (void)arg;
+    static ota_core_state_t state;
+    static size_t bytes;
+    static char error[sizeof(((ota_core_session_t *)0)->error)];
+    if (!events_wanted("ota")) {
+        return;
+    }
+    ota_core_session_t s;
+    ota_core_get(&s);
+    if (s.state != state || s.bytes != bytes || strcmp(s.error, error) != 0) {
+        state = s.state;
+        bytes = s.bytes;
+        strlcpy(error, s.error, sizeof(error));
+        events_changed("ota");
+    }
+}
+
+static void start_watching(void)
+{
+    events_declare("ota", session_json);
+    esp_timer_handle_t t;
+    const esp_timer_create_args_t args = { .callback = watch_session, .name = "web_ota" };
+    if (esp_timer_create(&args, &t) == ESP_OK) {
+        esp_timer_start_periodic(t, 1000 * 1000);
+    }
+}
+
 /* ------------------------------------------------------------------ registration */
 
 esp_err_t web_ota_register(void)
 {
     ota_core_set_puller(ota_pull_start);
+    start_watching();
     web_server_add_feature("ota");
     esp_err_t err = ESP_OK;
     err |= web_register("/api/v1/ota", HTTP_GET, ota_get, 0);

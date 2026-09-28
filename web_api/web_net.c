@@ -9,9 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "lwip/inet.h"
+#include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "wifi_ap.h"
+#include "events.h"
 #include "wifi_known.h"
 #include "web_net.h"
 #include "web_server.h"
@@ -165,6 +167,7 @@ static esp_err_t known_put(httpd_req_t *req)
     if (err != ESP_OK) {
         return web_send_error(req, 500, "failed", "not saved: %s", esp_err_to_name(err));
     }
+    events_changed("network");
     return web_send_json(req, 200, network_json());
 }
 
@@ -181,6 +184,7 @@ static esp_err_t known_delete(httpd_req_t *req)
     const esp_err_t sent = httpd_resp_send(req, NULL, 0);
     bool had = false;
     wifi_known_forget(ssid, &had);      /* after: it drops the link if it is the one in use */
+    events_changed("network");
     return sent;
 }
 
@@ -267,9 +271,23 @@ static esp_err_t ap_patch(httpd_req_t *req)
     return sent;
 }
 
+/* The station and the access point coming and going; not a scan finishing. */
+static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    (void)data;
+    if (base == WIFI_EVENT && (id == WIFI_EVENT_SCAN_DONE || id == WIFI_EVENT_STA_BEACON_TIMEOUT)) {
+        return;
+    }
+    events_changed("network");
+}
+
 esp_err_t web_net_register(void)
 {
     web_server_add_feature("network");
+    events_declare("network", network_json);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi, NULL);
+    esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, on_wifi, NULL);
     esp_err_t err = ESP_OK;
     err |= web_register("/api/v1/network", HTTP_GET, network_get, 0);
     err |= web_register("/api/v1/network", HTTP_PATCH, network_patch, WEB_AUTH);

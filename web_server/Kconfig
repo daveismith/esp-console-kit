@@ -16,6 +16,15 @@ menu "Web server (web_server)"
             The server keeps three more sockets for itself: CONFIG_LWIP_MAX_SOCKETS must
             cover these, those three, and everything else the application opens.
 
+    config WEB_SERVER_MAX_STREAMS
+        int "Most event streams open at once"
+        default 3
+        range 1 8
+        help
+            GET /api/v1/events holds a connection open for each browser tab (or other client)
+            that follows the board's events, out of WEB_SERVER_MAX_SOCKETS. One more gets 503
+            busy, and the web app polls instead.
+
     config WEB_SERVER_STACK_SIZE
         int "Server task stack"
         default 6144
