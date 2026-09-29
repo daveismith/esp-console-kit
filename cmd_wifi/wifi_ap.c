@@ -31,7 +31,9 @@ static const char *TAG = "wifi_ap";
 #define AP_IFKEY "WIFI_AP_DEF"
 
 static bool s_on;
+#if CONFIG_CMD_WIFI_AP_CAPTIVE_DNS
 static char s_portal_uri[32];       /* DHCP option 114 keeps a pointer to it */
+#endif
 static esp_timer_handle_t s_off_timer;  /* on for a while: turns it off */
 static int64_t s_off_at_us;         /* when, by esp_timer_get_time(); 0 stays on */
 
@@ -144,9 +146,14 @@ static void dns_task(void *arg)
 }
 #endif
 
-/* The DHCP server offers the board as DNS server and its page as the captive portal. */
+/*
+ * With the captive portal, the DHCP server offers the board as DNS server and its page as the
+ * portal. Without it the DHCP server is left as IDF sets it up: a board with no web page must
+ * not tell a phone that joins to open one.
+ */
 static void setup_dhcp(esp_netif_t *ap)
 {
+#if CONFIG_CMD_WIFI_AP_CAPTIVE_DNS
     esp_netif_ip_info_t ip = { 0 };
     esp_netif_get_ip_info(ap, &ip);
     esp_netif_dhcps_stop(ap);
@@ -161,11 +168,12 @@ static void setup_dhcp(esp_netif_t *ap)
                            strlen(s_portal_uri));
     esp_netif_dhcps_start(ap);
 
-#if CONFIG_CMD_WIFI_AP_CAPTIVE_DNS
     static bool dns_started;
     if (!dns_started) {
         dns_started = xTaskCreate(dns_task, "captive_dns", 3072, (void *)(uintptr_t)ip.ip.addr, 3, NULL) == pdPASS;
     }
+#else
+    (void)ap;
 #endif
 }
 
@@ -360,7 +368,11 @@ static void print_ap(void)
                    (unsigned)(ap.off_in_s % 60));
         }
         printf("pass: %s\n", ap.passphrase);
+#if CONFIG_CMD_WIFI_AP_CAPTIVE_DNS
         printf("page: http://" IPSTR "/\n", IP2STR(&ip));
+#else
+        printf("address: " IPSTR "\n", IP2STR(&ip));
+#endif
     } else {
         printf("ap: off (`wifi ap on` starts it; off again at every boot)\n");
         printf("ssid: %s\npass: %s\n", ap.ssid, ap.passphrase);

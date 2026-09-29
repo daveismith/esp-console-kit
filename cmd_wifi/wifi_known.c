@@ -234,6 +234,16 @@ static void known_erase(const char *ssid)
 
 /* ------------------------------------------------------------------ events */
 
+/*
+ * A failure worth a WARN when nobody is listening; with a hook installed, the application
+ * reports it (an event log, a UI) and this drops to INFO, so a log that forwards WARN and above
+ * does not carry one fact twice.
+ */
+static esp_log_level_t fault_level(void)
+{
+    return s_hook != NULL ? ESP_LOG_INFO : ESP_LOG_WARN;
+}
+
 static void emit(wifi_known_event_t event, const char *ssid, int reason, bool reconnecting)
 {
     wifi_known_hook_t hook = s_hook;
@@ -340,7 +350,7 @@ static void on_disconnected(const wifi_event_sta_disconnected_t *ev)
         s_join_result = auth ? RESULT_AUTH_FAILED : RESULT_FAILED;
         unlock();
 
-        ESP_LOGW(TAG, "join %s failed, reason %d%s%s", ssid, (int)ev->reason,
+        ESP_LOG_LEVEL_LOCAL(fault_level(), TAG, "join %s failed, reason %d%s%s", ssid, (int)ev->reason,
                  auth ? " (authentication)" : "", keep_trying ? "; retrying" : "");
         emit(auth ? WIFI_KNOWN_EVT_AUTH_FAILED : WIFI_KNOWN_EVT_JOIN_FAILED, ssid,
              ev->reason, keep_trying);
@@ -361,7 +371,7 @@ static void on_disconnected(const wifi_event_sta_disconnected_t *ev)
     unlock();
 
     if (had_ip) {
-        ESP_LOGW(TAG, "link to %s lost, reason %d%s", from, (int)ev->reason,
+        ESP_LOG_LEVEL_LOCAL(fault_level(), TAG, "link to %s lost, reason %d%s", from, (int)ev->reason,
                  want ? "; reconnecting" : "");
         emit(WIFI_KNOWN_EVT_LINK_LOST, from, ev->reason, want);
     }
@@ -563,15 +573,29 @@ esp_err_t wifi_known_join(const char *ssid, const char *passphrase)
     return err;
 }
 
-/* True when `ssid` is the network the radio is actually associated with right now. */
-static bool sta_is_on(const char *ssid)
+/*
+ * True when `ssid` is the network the station uses: associated with it now, or configured for
+ * it -- which is also a join that failed and is being retried (the fast retries and the retry
+ * timer both reconnect from the driver's configuration). Asking only "associated" missed that
+ * case, and a forgotten network went on being retried in the background.
+ */
+static bool sta_uses(const char *ssid)
 {
+    char current[SSID_LEN];
     wifi_ap_record_t ap;
-    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        strlcpy(current, (const char *)ap.ssid, sizeof(current));
+        if (strcmp(current, ssid) == 0) {
+            return true;
+        }
+    }
+    wifi_config_t cfg = { 0 };
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK) {
         return false;
     }
-    char current[SSID_LEN];
-    strlcpy(current, (const char *)ap.ssid, sizeof(current));
+    memcpy(current, cfg.sta.ssid, sizeof(cfg.sta.ssid));
+    current[sizeof(cfg.sta.ssid)] = '\0';
+    memset(&cfg, 0, sizeof(cfg));
     return strcmp(current, ssid) == 0;
 }
 
@@ -588,9 +612,10 @@ esp_err_t wifi_known_forget(const char *ssid, bool *was_stored)
     const bool joining = s_joining && strcmp(s_join_ssid, ssid) == 0;
     unlock();
 
-    /* Asked of the driver, not of s_join_ssid: a link made by the plain `join` command, or
-     * one still up from the boot rejoin, is not in the join fields but is still in use. */
-    if (s_started && (joining || sta_is_on(ssid))) {
+    /* Asked of the driver, not of s_join_ssid: a link made by the plain `join` command, one
+     * still up from the boot rejoin, or a failed join being retried is not in the join fields
+     * but is still in use. */
+    if (s_started && (joining || sta_uses(ssid))) {
         /* Before the disconnect, always: the DISCONNECTED handler reconnects while
          * s_want_connected is set, which would put the link straight back up. And the join
          * in flight is cleared, or a GOT_IP already on its way would write the SSID back as
@@ -612,6 +637,9 @@ esp_err_t wifi_known_forget(const char *ssid, bool *was_stored)
     }
     if (was_stored != NULL) {
         *was_stored = had;
+    }
+    if (had) {
+        emit(WIFI_KNOWN_EVT_FORGOTTEN, ssid, 0, false);
     }
     return ESP_OK;
 }
@@ -638,10 +666,12 @@ void wifi_known_set_enabled(bool enabled)
     unlock();
 
     if (!enabled) {
+        emit(WIFI_KNOWN_EVT_DISABLED, NULL, 0, false);
         esp_timer_stop(s_retry_timer);
         esp_wifi_disconnect();
         return;
     }
+    emit(WIFI_KNOWN_EVT_ENABLED, NULL, 0, true);
     wifi_config_t cfg = { 0 };
     if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.ssid[0] != '\0') {
         esp_wifi_connect();
@@ -710,8 +740,10 @@ static int by_rssi(const void *a, const void *b)
 esp_err_t wifi_known_scan(wifi_known_scan_t *out, size_t max, size_t *found)
 {
     *found = 0;
-    const wifi_scan_config_t cfg = { .show_hidden = false };
-    esp_err_t err = esp_wifi_scan_start(&cfg, true);
+    /* NULL, not a zeroed config: IDF's defaults (active, hidden ones not shown, 30 ms back on
+     * the home channel between channels). A zeroed config asks for no time on the home channel,
+     * which IDF 6.1 refuses with ESP_ERR_INVALID_ARG while the station is connected. */
+    esp_err_t err = esp_wifi_scan_start(NULL, true);
     if (err != ESP_OK) {
         return err;     /* ESP_ERR_WIFI_STATE while the station is connecting */
     }

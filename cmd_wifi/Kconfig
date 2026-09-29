@@ -41,6 +41,7 @@ menu "Console WiFi commands (cmd_wifi)"
         help
             A phone that joins the access point checks for internet by fetching a known page;
             answering every name with the board makes that land on the board's web page, and
-            the phone offers to open it.
+            the phone offers to open it. Off, the DHCP server offers no captive-portal URL
+            either and no DNS responder runs: for a board with no web page.
 
 endmenu

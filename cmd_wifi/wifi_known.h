@@ -18,16 +18,23 @@ typedef enum {
     WIFI_KNOWN_EVT_JOIN_FAILED,   /* a join failed for a reason other than authentication */
     WIFI_KNOWN_EVT_AUTH_FAILED,   /* a join failed authentication; nothing was stored */
     WIFI_KNOWN_EVT_LINK_LOST,     /* a link that had an address dropped */
+    WIFI_KNOWN_EVT_ENABLED,       /* `wifi on` / wifi_known_set_enabled(true), before it reconnects */
+    WIFI_KNOWN_EVT_DISABLED,      /* `wifi off` / wifi_known_set_enabled(false) */
+    WIFI_KNOWN_EVT_FORGOTTEN,     /* a stored network was dropped */
 } wifi_known_event_t;
 
 typedef struct {
     wifi_known_event_t event;
-    const char *ssid;             /* valid only for the duration of the hook call */
+    const char *ssid;             /* valid only for the duration of the hook call; NULL for
+                                     ENABLED and DISABLED */
     int reason;                   /* wifi_err_reason_t for failures and losses, else 0 */
     bool reconnecting;            /* whether a reconnect will be attempted */
 } wifi_known_info_t;
 
-/* Called on the default event loop task. Must not block. */
+/* Called on the default event loop task for what the radio did, and on the caller's task for
+ * what was asked of the store (JOINING, ENABLED, DISABLED, FORGOTTEN), so every door -- the
+ * console, an application's own UI -- is heard the same way. Must not block. ENABLED comes
+ * before the reconnect, so the application can prepare the interface (a MAC to apply). */
 typedef void (*wifi_known_hook_t)(const wifi_known_info_t *info, void *ctx);
 
 /* Register `wifi [on|off]`, `wifi_save`, `wifi_forget` and `wifi_known`. */

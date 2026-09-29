@@ -29,7 +29,10 @@ Notes:
 - `wifi_known` keeps saved networks in one NVS blob (namespace
   `CONFIG_CMD_WIFI_KNOWN_NVS_NAMESPACE`). It rejoins the last network at boot and
   reconnects when the link drops. `wifi_known_set_hook()` reports link changes to
-  the application. It needs NVS and the default event loop before
+  the application, and what was asked of the store from any door (enabled, disabled,
+  forgotten), so a console command and an application's own UI are heard the same way.
+  With a hook installed, a failed join or a lost link logs at INFO rather than WARN: the
+  application reports it. It needs NVS and the default event loop before
   `wifi_known_start()`.
 
 - `cmd_fs` works on any mounted VFS volume. `cmd_fs_config_t` gives it the mount
@@ -103,7 +106,9 @@ Notes:
   network; `off_in_s` in its info and the API, `off in m:ss` in `wifi ap`): WPA2 with a random
   passphrase kept in NVS (the MAC is the BSSID, so it would be a poor secret), DHCP offering the
   board as DNS and captive portal, and a small DNS responder answering every name with the board.
-  `CONFIG_CMD_WIFI_AP_SSID_PREFIX` names it `<prefix>-xxxx`.
+  `CONFIG_CMD_WIFI_AP_SSID_PREFIX` names it `<prefix>-xxxx`. With `CONFIG_CMD_WIFI_AP_CAPTIVE_DNS`
+  off there is no captive portal at all -- no DNS responder and no portal URL in DHCP -- for a
+  board with no web page.
 - `servo` drives hobby servos on PCA9685 boards over I2C, or on the chip's own pins
   with MCPWM (one timer each, so six on an S3).
   - Each servo has an absolute pulse range it is never driven outside, and a working
