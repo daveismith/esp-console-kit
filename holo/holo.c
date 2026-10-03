@@ -89,7 +89,17 @@ typedef struct {
     int64_t next_us;        /* twitch: when the next glance starts */
     int step;               /* scan: which end is next */
     uint16_t sent_h, sent_v;/* permille last sent; 0xffff for "send the next one whatever it is" */
+    int64_t motion_t0;      /* when the running motion began */
     const char *stopped;    /* why the last motion ended early, NULL if it did not */
+    motion_t stopped_motion;/* and which it was, the axis the hook refused (NULL for a disarm),
+                               and when -- so a panel can say "SCAN stopped 40 s ago: not
+                               fitted (pca1_1)" long after the log line scrolled off */
+    const char *stopped_axis;
+    int64_t stopped_at;
+    /* A leia's flicker, whoever asked for it -- the console, an API caller, a dome button.
+     * Kept here rather than by any one of them so each sees the others'. Cleared by the
+     * flicker ending and by any other light command. */
+    bool leia;
 } holo_t;
 
 /* With the default hooks, whether this file has moved each axis since boot: before that,
@@ -268,16 +278,23 @@ static void segment(holo_t *h, float x1, float y1, int64_t dur_us, bool ease, in
     h->moving = true;
 }
 
-static void stop_motion(size_t i, const char *why)
+/* End the motion. `why` is NULL when it ended as asked -- by itself, by STOP, by a new
+ * command -- and a HOLO_WHY_* when something took it away, with `axis` the one refused
+ * where one was: that is kept, with when, for anybody who asks later. */
+static void stop_motion(size_t i, const char *why, const char *axis)
 {
     holo_t *h = &s_holo[i];
     if (why != NULL && (h->moving || h->motion != MOT_HOLD)) {
-        ESP_LOGI(TAG, "%s: %s stopped: %s", s_desc[i].name, MOTION_NAMES[h->motion], why);
+        ESP_LOGI(TAG, "%s: %s stopped: %s%s%s%s", s_desc[i].name, MOTION_NAMES[h->motion], why,
+                 axis ? " (" : "", axis ? axis : "", axis ? ")" : "");
     }
+    h->stopped = why;
+    h->stopped_motion = why != NULL ? h->motion : MOT_HOLD;
+    h->stopped_axis = why != NULL ? axis : NULL;
+    h->stopped_at = why != NULL ? esp_timer_get_time() : 0;
     h->motion = MOT_HOLD;
     h->moving = false;
     h->motion_until = 0;
-    h->stopped = why;
 }
 
 /* The segment after the one that just ended, or the end of the behaviour. */
@@ -344,19 +361,23 @@ static void next_segment(size_t i, int64_t now)
     }
 }
 
-/* Put the axes where x and y say. Only an axis whose permille changed is sent. */
-static bool send(size_t i, const char **why)
+/* Put the axes where x and y say. Only an axis whose permille changed is sent. False with
+ * `why` and the axis that refused in `*axis`. */
+static bool send(size_t i, const char **why, const char **axis)
 {
     holo_t *h = &s_holo[i];
     const uint16_t ph = to_permille(h->x), pv = to_permille(h->y);
     if (ph != h->sent_h) {
+        *axis = s_desc[i].h;
         if (!move_axis(s_desc[i].h, ph, why)) return false;
         h->sent_h = ph;
     }
     if (pv != h->sent_v) {
+        *axis = s_desc[i].v;
         if (!move_axis(s_desc[i].v, pv, why)) return false;
         h->sent_v = pv;
     }
+    *axis = NULL;
     return true;
 }
 
@@ -406,6 +427,7 @@ static bool tick_holo(size_t i, int64_t now, bool armed)
             h->led = h->after;
             h->led_t0 = now;
             h->led_until = 0;
+            h->leia = false;
         }
         h->duty = led_duty(h, now);
         servo_set_duty(s_desc[i].led, h->duty);   /* false until its board answers: nothing to do */
@@ -415,11 +437,11 @@ static bool tick_holo(size_t i, int64_t now, bool armed)
         return led_animated(h);
     }
     if (!armed) {
-        stop_motion(i, HOLO_WHY_NOT_ARMED);
+        stop_motion(i, HOLO_WHY_NOT_ARMED, NULL);
         return led_animated(h);
     }
     if (h->motion_until != 0 && now >= h->motion_until && !h->moving) {
-        stop_motion(i, NULL);
+        stop_motion(i, NULL, NULL);
         return led_animated(h);
     }
     if (h->moving) {
@@ -428,9 +450,9 @@ static bool tick_holo(size_t i, int64_t now, bool armed)
         const float e = h->ease ? f * f * (3.0f - 2.0f * f) : f;
         h->x = h->x0 + (h->x1 - h->x0) * e;
         h->y = h->y0 + (h->y1 - h->y0) * e;
-        const char *why = NULL;
-        if (!send(i, &why)) {
-            stop_motion(i, why);
+        const char *why = NULL, *axis = NULL;
+        if (!send(i, &why, &axis)) {
+            stop_motion(i, why, axis);
             return led_animated(h);
         }
         if (f >= 1.0f) {
@@ -624,7 +646,7 @@ static const char *motion_refusal(size_t i, const char **ident)
     return NULL;
 }
 
-static void set_led(size_t i, led_cfg_t cfg, const opts_t *o, int64_t now);
+static void set_led(size_t i, led_cfg_t cfg, float time_s, int64_t now);
 
 /* A new motion: from where the axis hook says the axes are, sending the first frame
  * whatever it is, so the channels are driven from the start. `time_s` > 0 ends it then. */
@@ -635,6 +657,8 @@ static void begin(size_t i, motion_t m, float time_s, int64_t now)
     h->motion = m;
     h->moving = false;
     h->stopped = NULL;
+    h->stopped_axis = NULL;
+    h->motion_t0 = now;
     h->sent_h = h->sent_v = 0xffff;
     h->ox = h->x;
     h->oy = h->y;
@@ -656,17 +680,17 @@ static const char *start_motion(size_t i, const holo_motion_t *m, const char **i
         s_last[i] = *m;
     }
     if (m->kind == HOLO_STOP) {
-        stop_motion(i, NULL);
+        stop_motion(i, NULL, NULL);
         return NULL;
     }
     if (m->kind == HOLO_OFF) {
         /* Motion stopped and the axes limp -- the next motion drives them again, from where
          * they were sent -- and the light off. */
-        stop_motion(i, NULL);
+        stop_motion(i, NULL, NULL);
         release_axis(s_desc[i].h);
         release_axis(s_desc[i].v);
         if (s_desc[i].led != NULL) {
-            set_led(i, (led_cfg_t){ LED_OFF, 100, 0 }, NULL, now);
+            set_led(i, (led_cfg_t){ LED_OFF, 100, 0 }, 0, now);
         }
         return NULL;
     }
@@ -814,33 +838,65 @@ static int cmd_motion(size_t i, const char *verb, int argc, char **argv)
     return 0;
 }
 
-static void set_led(size_t i, led_cfg_t cfg, const opts_t *o, int64_t now)
+/* The one place the light changes. `time_s` > 0 is a timed mode. */
+static void set_led(size_t i, led_cfg_t cfg, float time_s, int64_t now)
 {
     holo_t *h = &s_holo[i];
-    if (o != NULL && o->has_t) {
+    if (time_s > 0) {
         /* Timed: back to what it was, unless it was already timed -- then back to what
          * that one would have gone back to, so a chain of timed modes unwinds in one. */
         if (h->led_until == 0) h->after = h->led;
-        h->led_until = now + (int64_t)(o->t * 1e6f);
+        h->led_until = now + (int64_t)(time_s * 1e6f);
     } else {
         h->led_until = 0;
     }
     h->led = cfg;
     h->led_t0 = now;
+    h->leia = false;   /* whatever this is, it is not the leia any more */
+}
+
+/* Why holo i's light cannot be set now, or NULL: it has none, or its channel's board has
+ * not answered -- then `*ident` names the channel. */
+static const char *light_refusal(size_t i, const char **ident)
+{
+    *ident = NULL;
+    if (s_desc[i].led == NULL) return HOLO_WHY_NO_LIGHT;
+    if (!servo_exists(s_desc[i].led)) {
+        *ident = s_desc[i].led;
+        return HOLO_WHY_NOT_FITTED;
+    }
+    return NULL;
 }
 
 /* A holo with no light, or one whose channel is not there: say so, and refuse. */
 static bool refuse_light(size_t i)
 {
-    if (s_desc[i].led == NULL) {
-        printf("%s: refused, it has no light\n", s_desc[i].name);
-        return true;
+    const char *ident = NULL;
+    const char *why = light_refusal(i, &ident);
+    if (why == NULL) return false;
+    if (ident != NULL) {
+        printf("%s: refused, %s (%s)\n", s_desc[i].name, why, ident);
+    } else {
+        printf("%s: refused, it has %s\n", s_desc[i].name, why);
     }
-    if (!servo_exists(s_desc[i].led)) {
-        printf("%s: refused, %s (%s)\n", s_desc[i].name, HOLO_WHY_NOT_FITTED, s_desc[i].led);
-        return true;
-    }
-    return false;
+    return true;
+}
+
+/* The message from Leia, the lock held and the light already allowed: the light flickers
+ * for as long as it plays, then goes back to what it was, and the holo looks straight out
+ * if it may. True when it was centred; false with the centre's refusal in `why` and the
+ * axis in `ident`, the light flickering regardless. */
+static bool leia(size_t i, float time_s, int64_t now, const char **why, const char **ident)
+{
+    holo_t *h = &s_holo[i];
+    set_led(i, (led_cfg_t){ LED_FLICKER, 100, 0 }, time_s, now);
+    h->leia = true;
+    *ident = NULL;
+    *why = motion_refusal(i, ident);
+    if (*why != NULL) return false;
+    begin(i, MOT_MOVE, 0, now);
+    segment(h, 0, 0, travel_us(h->x, h->y, 250, 500), true, now);
+    return true;
 }
 
 static int cmd_led(size_t i, int argc, char **argv)
@@ -876,7 +932,7 @@ static int cmd_led(size_t i, int argc, char **argv)
         printf("holo: led takes off|on [pct]|pulse|flicker|blink\n");
         return 1;
     }
-    set_led(i, cfg, &o, now);
+    set_led(i, cfg, o.has_t ? o.t : 0, now);
     printf("%s: led %s", s_desc[i].name, LED_NAMES[cfg.mode]);
     if (cfg.mode != LED_OFF) printf(" %u%%", cfg.level);
     if (cfg.period_ms) printf(", %u ms", (unsigned)cfg.period_ms);
@@ -960,15 +1016,19 @@ static void print_holo(size_t i, int64_t now)
     } else {
         printf(", position unknown");
     }
-    if (h->stopped) printf("; stopped: %s", h->stopped);
+    if (h->stopped) {
+        printf("; %s stopped %.0f s ago: %s", MOTION_NAMES[h->stopped_motion],
+               (double)(now - h->stopped_at) / 1e6, h->stopped);
+        if (h->stopped_axis != NULL) printf(" (%s)", h->stopped_axis);
+    }
     printf("\n");
 
     if (d->led != NULL) {
         if (!servo_exists(d->led)) {
             printf("       led    not fitted\n");
         } else {
-            printf("       led    %s %u%%, duty %u/%u", LED_NAMES[h->led.mode], h->led.level,
-                   (unsigned)h->duty, (unsigned)SERVO_DUTY_FULL);
+            printf("       led    %s %u%%, duty %u/%u%s", LED_NAMES[h->led.mode], h->led.level,
+                   (unsigned)h->duty, (unsigned)SERVO_DUTY_FULL, h->leia ? ", leia" : "");
             if (h->led_until != 0) {
                 printf(", %.1f s then %s %u%%", (double)(h->led_until - now) / 1e6,
                        LED_NAMES[h->after.mode], h->after.level);
@@ -1065,22 +1125,12 @@ static int cmd_holo(int argc, char **argv)
                 if (!parse_opts(argc, argv, 3, "t", &o) || refuse_light(i)) {
                     r = 1;
                 } else {
-                    /* The message from Leia: the light flickers for as long as it plays, then
-                     * goes back to what it was, and the holo looks straight out if it may. */
-                    if (!o.has_t) {
-                        o.has_t = true;
-                        o.t = 30.0f;
-                    }
-                    const int64_t now = esp_timer_get_time();
-                    set_led(i, (led_cfg_t){ LED_FLICKER, 100, 0 }, &o, now);
-                    const char *ident = NULL;
-                    const char *why = motion_refusal(i, &ident);
-                    if (why == NULL) {
-                        begin(i, MOT_MOVE, 0, now);
-                        segment(&s_holo[i], 0, 0, travel_us(s_holo[i].x, s_holo[i].y, 250, 500), true, now);
-                        printf("%s: leia for %.1f s, centred\n", s_desc[i].name, o.t);
+                    const float t = o.has_t ? o.t : 30.0f;
+                    const char *why = NULL, *ident = NULL;
+                    if (leia(i, t, esp_timer_get_time(), &why, &ident)) {
+                        printf("%s: leia for %.1f s, centred\n", s_desc[i].name, t);
                     } else {
-                        printf("%s: leia for %.1f s, not centred: %s\n", s_desc[i].name, o.t, why);
+                        printf("%s: leia for %.1f s, not centred: %s\n", s_desc[i].name, t, why);
                     }
                     r = 0;
                 }
@@ -1111,6 +1161,107 @@ size_t holo_count(void)
 const char *holo_name(size_t idx)
 {
     return idx < s_count ? s_desc[idx].name : NULL;
+}
+
+bool holo_describe(size_t idx, holo_desc_t *out)
+{
+    if (idx >= s_count || out == NULL) return false;
+    *out = s_desc[idx];
+    return true;
+}
+
+/* A refusal for a caller's buffer, as the console prints one after "refused, ". */
+static void refusal(char *why, size_t why_len, const char *what, const char *ident)
+{
+    if (ident != NULL) {
+        snprintf(why, why_len, "%s (%s)", what, ident);
+    } else {
+        snprintf(why, why_len, "%s", what);
+    }
+}
+
+static bool no_such(size_t idx, char *why, size_t why_len)
+{
+    if (s_task != NULL && idx < s_count) return false;
+    snprintf(why, why_len, "%s", s_task == NULL ? "not started" : "no such holo");
+    return true;
+}
+
+static holo_light_t light_of(const led_cfg_t *c)
+{
+    return (holo_light_t){ .mode = (holo_light_mode_t)c->mode, .level = c->level, .period_ms = c->period_ms };
+}
+
+esp_err_t holo_light(size_t idx, const holo_light_t *light, float time_s, char *why, size_t why_len)
+{
+    if (no_such(idx, why, why_len)) return ESP_ERR_NOT_FOUND;
+    if (light == NULL || light->mode > HOLO_LIGHT_BLINK) {
+        snprintf(why, why_len, "`mode` is off, on, pulse, flicker or blink");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (light->level > 100) {
+        snprintf(why, why_len, "`level` is 0..100");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (light->period_ms != 0 && (light->period_ms < 200 || light->period_ms > 60000)) {
+        snprintf(why, why_len, "`period_ms` is 200..60000");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (time_s != 0 && !(time_s >= 0.1f && time_s <= 3600.0f)) {
+        snprintf(why, why_len, "`time_s` is 0.1..3600");
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* The console's defaults: a pulse breathes over 2 s, a blink is 1 s. The other modes
+     * never read the period, so 0 is left alone there. */
+    led_cfg_t cfg = { .mode = (led_mode_t)light->mode, .level = light->level, .period_ms = light->period_ms };
+    if (cfg.period_ms == 0) {
+        cfg.period_ms = cfg.mode == LED_PULSE ? 2000 : cfg.mode == LED_BLINK ? 1000 : 0;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const char *ident = NULL;
+    const char *refused = light_refusal(idx, &ident);
+    if (refused == NULL) {
+        set_led(idx, cfg, time_s, esp_timer_get_time());
+    }
+    xSemaphoreGive(s_lock);
+    xTaskNotifyGive(s_task);
+    if (refused != NULL) {
+        refusal(why, why_len, refused, ident);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (why_len > 0) why[0] = '\0';
+    return ESP_OK;
+}
+
+esp_err_t holo_leia(size_t idx, float time_s, bool *centred, char *why, size_t why_len)
+{
+    if (centred != NULL) *centred = false;
+    if (no_such(idx, why, why_len)) return ESP_ERR_NOT_FOUND;
+    if (time_s != 0 && !(time_s >= 0.1f && time_s <= 3600.0f)) {
+        snprintf(why, why_len, "`time_s` is 0.1..3600");
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const char *ident = NULL;
+    const char *refused = light_refusal(idx, &ident);
+    bool did_centre = false;
+    const char *centre_why = NULL, *centre_ident = NULL;
+    if (refused == NULL) {
+        did_centre = leia(idx, time_s > 0 ? time_s : 30.0f, esp_timer_get_time(), &centre_why, &centre_ident);
+    }
+    xSemaphoreGive(s_lock);
+    xTaskNotifyGive(s_task);
+    if (refused != NULL) {
+        refusal(why, why_len, refused, ident);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (centred != NULL) *centred = did_centre;
+    if (!did_centre) {
+        refusal(why, why_len, centre_why, centre_ident);
+    } else if (why_len > 0) {
+        why[0] = '\0';
+    }
+    return ESP_OK;
 }
 
 bool holo_motion_check(const holo_motion_t *m, char *why, size_t why_len)
@@ -1180,6 +1331,7 @@ esp_err_t holo_status(size_t idx, holo_status_t *out)
     }
     memset(out, 0, sizeof(*out));
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    const int64_t now = esp_timer_get_time();
     const holo_t *h = &s_holo[idx];
     const holo_desc_t *d = &s_desc[idx];
     out->name = d->name;
@@ -1194,6 +1346,23 @@ esp_err_t holo_status(size_t idx, holo_status_t *out)
     out->placed = get_axis(d->h, &ax) && get_axis(d->v, &ay) && ax.placed && ay.placed;
     out->x = out->placed ? from_permille(ax.permille) : h->x;
     out->y = out->placed ? from_permille(ay.permille) : h->y;
+
+    /* Spans, never negative: a deadline the task has not yet acted on reads as 0 left. */
+    const bool running = h->motion != MOT_HOLD;
+    out->motion_elapsed_ms = running ? (uint32_t)((now - h->motion_t0) / 1000) : 0;
+    out->motion_remaining_ms = running && h->motion_until != 0
+                               ? (uint32_t)((h->motion_until > now ? h->motion_until - now : 0) / 1000)
+                               : UINT32_MAX;
+    out->stopped_motion = h->stopped != NULL ? MOTION_NAMES[h->stopped_motion] : NULL;
+    out->stopped_axis = h->stopped != NULL ? h->stopped_axis : NULL;
+    out->stopped_ms_ago = h->stopped != NULL ? (uint32_t)((now - h->stopped_at) / 1000) : 0;
+    out->light_fitted = d->led != NULL && servo_exists(d->led);
+    out->light = light_of(&h->led);
+    out->light_remaining_ms = h->led_until != 0
+                              ? (uint32_t)((h->led_until > now ? h->led_until - now : 0) / 1000)
+                              : UINT32_MAX;
+    out->light_after = light_of(&h->after);
+    out->leia = h->leia;
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }

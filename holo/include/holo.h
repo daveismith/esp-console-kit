@@ -27,6 +27,8 @@ extern "C" {
 #define HOLO_WHY_UNKNOWN      "unknown axis"
 #define HOLO_WHY_NOT_FITTED   "not fitted"
 #define HOLO_WHY_UNCALIBRATED "uncalibrated"
+/* And why a light command was: the holo was described without one. */
+#define HOLO_WHY_NO_LIGHT     "no light"
 
 /** One holoprojector. The strings must outlive the engine. */
 typedef struct {
@@ -120,6 +122,37 @@ esp_err_t holo_motion(size_t idx, const holo_motion_t *m, char *why, size_t why_
 /** Whether `m`'s parameters are within range, without starting it: false with `why`. */
 bool holo_motion_check(const holo_motion_t *m, char *why, size_t why_len);
 
+/* The light's modes, in the console's order: `holo <holo> led off|on|pulse|flicker|blink`. */
+typedef enum {
+    HOLO_LIGHT_OFF, HOLO_LIGHT_ON, HOLO_LIGHT_PULSE, HOLO_LIGHT_FLICKER, HOLO_LIGHT_BLINK,
+} holo_light_mode_t;
+
+typedef struct {
+    holo_light_mode_t mode;
+    uint8_t level;              /**< 0..100 percent; meaningless for OFF */
+    uint32_t period_ms;         /**< pulse, blink: 200..60000; 0 the mode's default (2000, 1000) */
+} holo_light_t;
+
+/**
+ * Set holo `idx`'s light, as `holo <holo> led ...` does. `time_s` > 0 makes it a timed
+ * mode that goes back to what the light was doing after that long (`-t`); 0 is for good.
+ * ESP_ERR_INVALID_ARG for a level, period or time out of range, ESP_ERR_INVALID_STATE
+ * when the holo has no light or its channel is not there (HOLO_WHY_NO_LIGHT,
+ * HOLO_WHY_NOT_FITTED with the channel: "not fitted (pca1_0)"), ESP_ERR_NOT_FOUND for no
+ * such holo -- each with `why`, which carries no name prefix.
+ */
+esp_err_t holo_light(size_t idx, const holo_light_t *light, float time_s, char *why, size_t why_len);
+
+/**
+ * The message from Leia, as `holo <holo> leia` does it: the light flickers at full for
+ * `time_s` (0: the default 30 s) and then goes back to what it was, and the holo looks
+ * straight out if it may. ESP_OK once the light half ran, with `*centred` saying whether
+ * the centre did too; when it did not, `why` is the centre's refusal ("uncalibrated
+ * (pca1_2)"). ESP_ERR_INVALID_STATE with `why` when the light half itself could not run,
+ * ESP_ERR_INVALID_ARG for a time out of range, ESP_ERR_NOT_FOUND for no such holo.
+ */
+esp_err_t holo_leia(size_t idx, float time_s, bool *centred, char *why, size_t why_len);
+
 typedef struct {
     const char *name;
     bool ready;                 /**< it could move now */
@@ -130,9 +163,31 @@ typedef struct {
     bool has_light;
     bool placed;                /**< x, y are where the axes were sent; else where the engine thinks */
     float x, y;                 /**< -1..1: + is right, and up */
+
+    /* The motion in time. A panel draws a countdown from these, so they are spans from
+     * now rather than stamps: the caller's clock need not be the engine's. */
+    uint32_t motion_elapsed_ms;     /**< since the running motion began; 0 when holding */
+    uint32_t motion_remaining_ms;   /**< until a timed twitch or scan ends; UINT32_MAX when
+                                         there is no limit, or nothing runs */
+    /* The stop, when `stopped` is set: which motion it was, the axis the hook refused (or
+     * NULL, for a disarm), and how long ago. 0 and NULL otherwise. */
+    const char *stopped_motion;
+    const char *stopped_axis;
+    uint32_t stopped_ms_ago;
+
+    /* The light. `light_fitted` is `has_light` and its channel's board answering. */
+    bool light_fitted;
+    holo_light_t light;             /**< what it is doing now */
+    uint32_t light_remaining_ms;    /**< a timed mode: until it goes back; UINT32_MAX when not timed */
+    holo_light_t light_after;       /**< what it goes back to; meaningful when timed */
+    bool leia;                      /**< the light is a leia's flicker, from any caller, until it
+                                         ends or another light command replaces it */
 } holo_status_t;
 
 esp_err_t holo_status(size_t idx, holo_status_t *out);
+
+/** The description holo `idx` was started with (its name and channels); false past the end. */
+bool holo_describe(size_t idx, holo_desc_t *out);
 
 /** The last motion asked of holo `idx` -- by the console or any caller -- as it was asked; before
  *  any, a HOLO_STOP. With holo_status(), what it takes to put a holo back to what it was doing. */
