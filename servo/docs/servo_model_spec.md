@@ -264,22 +264,33 @@ policy fighting them.
 ### 6.1 Why not parameters
 
 The obvious answer is the ROS 2 parameter server: calibration is configuration, parameters are
-built in, `ros2 param set` is free tooling, and descriptors carry ranges. It was measured against
-this project and does not fit:
+built in, `ros2 param set` is free tooling, and descriptors carry ranges. **ROS 2 itself would
+allow most of what this binding needs**: rclcpp and rclpy parameters take strings, byte, bool,
+integer, double and string arrays, and a set callback returns a `SetParametersResult` with a
+reason of its own. **The limits below are rclc's**, the client library a microcontroller node
+uses, checked against its source (`rclc_parameter`, rclc 6.1.2, Jazzy) on 2026-10-11:
 
-- **rclc's parameter server costs 6 services and 1 publisher** — seven ROS entities. On this board
-  each costs roughly 0.9 KB of *internal* DRAM, the scarce heap, so ~6.3 KB before a single
-  parameter exists.
-- **rclc parameters are `BOOL`, `INT` or `DOUBLE` only.** No strings, no arrays. `joint`,
-  `display`, `actuator_type` and `raw_units` cannot be expressed.
+- **Only `BOOL`, `INT` and `DOUBLE`.** `rclc_parameter_type_t` has no string and no array. A
+  set of any other type is answered `Type not supported` — and, a bug in that version, with
+  `successful` still true, because the switch's default case sets the message without
+  setting an error. `joint`, `display`, `actuator_type` and `raw_units` cannot be expressed.
+- **A rejection carries no reason.** The change callback returns a bare `bool`, and a `false`
+  reaches the client as the fixed string `Rejected by server`. This model's refusal vocabulary
+  (§5) — `uncalibrated`, `out of range`, `not fitted` — has nowhere to go.
+  `set_parameters_atomically` is not implemented at all (`Unimplemented service`).
 - **It does not scale across servos on one node.** A node here can own 32 (two PCA9685 boards).
   At ~12 fields each that is ~380 parameters, every one carrying its own name buffer, in a
-  server whose request/response structures are preallocated from `max_params`.
-- Parameters are configuration. Using a parameter write to *move* something, or a parameter read
-  to sample a live position, is an abuse that costs a round trip per field and has no ack.
+  server whose request and response structures are preallocated from `max_params`.
+- **Parameters are configuration.** Using a parameter write to *move* something, or a parameter
+  read to sample a live position, is an abuse that costs a round trip per field and has no ack.
 
-Parameters remain a perfectly good binding for a Linux-class controller, and a node MAY mirror
-its configuration into parameters for tooling. They are not the interoperable contract.
+What rclc does have, and what a node mirroring its configuration can use: per-parameter
+descriptions, read-only flags, and integer and double range constraints. Its server is six
+services, plus a publisher when it notifies changes over DDS.
+
+Parameters remain a perfectly good binding for a Linux-class controller using rclcpp or rclpy,
+and a node MAY mirror its configuration into parameters for tooling. They are not the
+interoperable contract.
 
 ### 6.2 The binding
 
@@ -295,12 +306,13 @@ Three interfaces per controller node, **all servo-plural**, because a node owns 
 Normal joint motion needs **no new interface**: it is `sensor_msgs/JointState` on the existing
 command topic, in radians. That is the whole point of joint space being the public interface.
 
-Entity budget on this board: 3 services + 1 publisher ≈ 3.6 KB internal DRAM, against ~6.3 KB for
-a parameter server that could not carry the data anyway.
+Entity count: 3 services + 1 publisher, against six services and a publisher for a parameter
+server that could not carry the data anyway.
 
 **One state topic per node, not per servo.** `ServoStateArray` carries every servo the node owns.
-Thirty-two topics would be thirty-two publishers, ~29 KB of internal DRAM, and this board has
-about 35 KB free in total.
+Thirty-two topics would be thirty-two publishers on the controller and thirty-two
+subscriptions on every client that wants the whole picture, for state that is sampled
+together anyway.
 
 ### 6.3 Discovery
 
