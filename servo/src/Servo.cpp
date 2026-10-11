@@ -1,10 +1,13 @@
 #include "Servo.hpp"
 
 #include <inttypes.h>
+#include <new>
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "sdkconfig.h"
 
 using namespace servo;
 
@@ -34,6 +37,22 @@ static DrivePolicy unpack_policy(uint8_t drive, uint16_t settle)
     p.mid = (((drive >> 4) & 3) == 1) ? Drive::Release : Drive::Hold;
     p.settleMs = settle < SETTLE_MIN_MS ? SETTLE_MIN_MS : settle;
     return p;
+}
+
+void *Servo::operator new(size_t n)
+{
+#if CONFIG_SPIRAM
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p != nullptr) {
+        return p;
+    }
+#endif
+    return ::operator new(n);   /* internal, and the usual failure if that is gone too */
+}
+
+void Servo::operator delete(void *p)
+{
+    heap_caps_free(p);          /* takes either heap */
 }
 
 void Servo::SetIdent(std::string ident)

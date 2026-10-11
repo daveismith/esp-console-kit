@@ -1,6 +1,7 @@
 #ifndef SERVO_HPP_
 #define SERVO_HPP_
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string>
 
@@ -79,6 +80,14 @@ protected:
 
     virtual void ApplyValue(uint16_t value) = 0;
     virtual void ApplyEnable(bool enable) = 0;
+
+public:
+    /* Every servo object from PSRAM when the board has it, else as any other. A PCA9685 board
+     * registers 16 of them at 72 bytes, all under CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, so a
+     * plain new put 1.1 KB per board in internal DRAM. Nothing reads one while the cache is
+     * off: the frame task and the C API run with it on. */
+    static void *operator new(size_t n);
+    static void operator delete(void *p);
 
 public:
     Servo(uint16_t absMin, uint16_t absMax) : Servo(absMin, absMax, absMin, absMax, false) {}

@@ -1,0 +1,17 @@
+menu "Servo driver (servo)"
+
+    config SERVO_TASK_STACK_IN_PSRAM
+        bool "Servo task stack in PSRAM"
+        depends on SPIRAM
+        default n
+        help
+            The frame task's 4 KB stack from PSRAM instead of internal RAM. Safe only
+            while nothing on the task touches flash: every flash operation, reads
+            included, asserts an internal stack. The task flushes the controllers over
+            I2C, runs Servo::Tick() and calls the output listener; settings are loaded
+            and saved on the callers of the C API, never here. An application whose
+            output listener reads or writes NVS must leave this off. The I2C traffic is
+            fine, because the I2C interrupt is not IRAM-safe (CONFIG_I2C_ISR_IRAM_SAFE)
+            and so never runs while the cache is off.
+
+endmenu

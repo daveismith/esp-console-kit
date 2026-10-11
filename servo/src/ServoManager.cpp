@@ -1,10 +1,12 @@
 #include "ServoManager.hpp"
 #include "Servo.hpp"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 
 using namespace servo;
 
@@ -42,7 +44,13 @@ void ServoManager::StartTask()
     }
     /* The loop is tiny, but the I2C driver, a failure's ESP_LOGE and the output listener
      * (which may take the application's own locks) run on it. */
-    BaseType_t ok = xTaskCreate(servoManagerTask, "servo", 4096 /* 3072 held 1.4 KB before the policy tick and listener */, this, tskIDLE_PRIORITY + 1, NULL);
+    /* 3072 held 1.4 KB before the policy tick and listener. */
+#if CONFIG_SERVO_TASK_STACK_IN_PSRAM
+    BaseType_t ok = xTaskCreateWithCaps(servoManagerTask, "servo", 4096, this, tskIDLE_PRIORITY + 1, NULL,
+                                        MALLOC_CAP_SPIRAM);
+#else
+    BaseType_t ok = xTaskCreate(servoManagerTask, "servo", 4096, this, tskIDLE_PRIORITY + 1, NULL);
+#endif
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "cannot start the servo task");
         return;

@@ -326,8 +326,27 @@ static void register_flash_stats(void)
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
 
+static cmd_system_task_walk_hook_t s_walk_hook;
+static void *s_walk_ctx;
+
+void cmd_system_set_task_walk_hook(cmd_system_task_walk_hook_t hook, void *ctx)
+{
+    s_walk_ctx = ctx;
+    s_walk_hook = hook;
+}
+
 /** 'tasks' command prints the list of tasks and related information */
 #if WITH_TASKS_INFO
+
+static void walk_begin(void)
+{
+    if (s_walk_hook) s_walk_hook(true, s_walk_ctx);
+}
+
+static void walk_end(void)
+{
+    if (s_walk_hook) s_walk_hook(false, s_walk_ctx);
+}
 
 static int tasks_info(int argc, char **argv)
 {
@@ -342,7 +361,9 @@ static int tasks_info(int argc, char **argv)
     fputs("\tAffinity", stdout);
 #endif
     fputs("\n", stdout);
+    walk_begin();
     vTaskList(task_list_buffer);
+    walk_end();
     fputs(task_list_buffer, stdout);
     free(task_list_buffer);
     return 0;
@@ -393,9 +414,13 @@ static int top_cmd(int argc, char **argv)
     }
 
     configRUN_TIME_COUNTER_TYPE t0 = 0, t1 = 0;
+    walk_begin();
     UBaseType_t n0 = uxTaskGetSystemState(before, TOP_MAX_TASKS, &t0);
+    walk_end();
     vTaskDelay(pdMS_TO_TICKS(secs * 1000));
+    walk_begin();
     UBaseType_t n1 = uxTaskGetSystemState(after, TOP_MAX_TASKS, &t1);
+    walk_end();
 
     uint64_t total = (uint64_t)(t1 - t0);
     if (total == 0) {
