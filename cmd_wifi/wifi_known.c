@@ -50,6 +50,8 @@ static const char *TAG = "wifi_known";
 #define KNOWN_MAX     16
 #define KNOWN_KEY     "known"
 #define KNOWN_VERSION 1u
+/* Its own key rather than a field in the blob, so the blob keeps its size and version. */
+#define AUTOJOIN_KEY  "autojoin"
 
 typedef struct {
     char ssid[SSID_LEN];
@@ -95,6 +97,9 @@ static esp_timer_handle_t s_retry_timer;
 
 static wifi_known_hook_t s_hook;
 static void *s_hook_ctx;
+
+/* -1 until read from NVS. */
+static int s_autojoin = -1;
 
 static void lock(void)
 {
@@ -478,6 +483,39 @@ static esp_err_t known_init(void)
     return ESP_OK;
 }
 
+bool wifi_known_autojoin(void)
+{
+    if (s_autojoin < 0) {
+        uint8_t v = 1;
+        nvs_handle_t h;
+        if (nvs_open(CONFIG_CMD_WIFI_KNOWN_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+            nvs_get_u8(h, AUTOJOIN_KEY, &v);
+            nvs_close(h);
+        }
+        s_autojoin = v != 0;
+    }
+    return s_autojoin != 0;
+}
+
+esp_err_t wifi_known_set_autojoin(bool on)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(CONFIG_CMD_WIFI_KNOWN_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, AUTOJOIN_KEY, on ? 1 : 0);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    if (err == ESP_OK) {
+        s_autojoin = on;
+    } else {
+        ESP_LOGW(TAG, "autojoin: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 esp_err_t wifi_known_start(void)
 {
     const bool first = !s_started;
@@ -493,6 +531,10 @@ esp_err_t wifi_known_start(void)
     known_load();
     strlcpy(last, s_known.last, sizeof(last));
     unlock();
+    if (last[0] != '\0' && !wifi_known_autojoin()) {
+        ESP_LOGI(TAG, "auto join off; not rejoining %s (`wifi auto on`)", last);
+        return ESP_OK;
+    }
     if (last[0] != '\0') {
         ESP_LOGI(TAG, "rejoining %s", last);
         return wifi_known_join(last, NULL);
@@ -812,9 +854,13 @@ static void print_wifi_state(void)
     known_load();
     const bool any_saved = s_known.count > 0;
     unlock();
+    const bool autojoin = wifi_known_autojoin();
     printf("wifi: %s\n", s_want_connected ? "on"
-                         : any_saved ? "off, until `wifi on` or a reboot"
-                         : "idle, no saved network (`wifi_save <ssid> [pass]`)");
+                         : !any_saved ? "idle, no saved network (`wifi_save <ssid> [pass]`)"
+                         : autojoin ? "off, until `wifi on` or a reboot"
+                         : "off, until `wifi on`");
+    printf("auto join: %s\n", autojoin ? "on, the last network is rejoined at boot"
+                                       : "off, nothing is joined at boot");
     /* Only ask the driver about the access point with the station up: disconnected, the
      * question itself logs a warning. */
     wifi_ap_record_t ap;
@@ -847,6 +893,18 @@ static int cmd_wifi_power(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "ap") == 0) {
         return wifi_ap_command(argc - 1, argv + 1);
     }
+    if (argc >= 2 && strcmp(argv[1], "auto") == 0) {
+        if (argc > 3 || (argc == 3 && strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0)) {
+            printf("usage: wifi auto [on|off]\n");
+            return 1;
+        }
+        if (argc == 3 && wifi_known_set_autojoin(strcmp(argv[2], "on") == 0) != ESP_OK) {
+            printf("wifi auto: not saved\n");
+            return 1;
+        }
+        printf("auto join: %s\n", wifi_known_autojoin() ? "on" : "off");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "scan") == 0) {
         wifi_known_scan_t *nets = calloc(32, sizeof(*nets));
         size_t n = 0;
@@ -866,7 +924,7 @@ static int cmd_wifi_power(int argc, char **argv)
         return err == ESP_OK ? 0 : 1;
     }
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "on") != 0 && strcmp(argv[1], "off") != 0)) {
-        printf("usage: wifi [on|off] | wifi scan | wifi ap [on|off] [--ssid <ssid>] [--pass <passphrase>]\n");
+        printf("usage: wifi [on|off] | wifi auto [on|off] | wifi scan | wifi ap [on|off] [--ssid <ssid>] [--pass <passphrase>]\n");
         return 1;
     }
     if (argc == 2) {
@@ -977,7 +1035,7 @@ void wifi_known_register_commands(void)
         .command = "wifi",
         .help = "WiFi on or off, the stored networks untouched; alone, the link and the default route. "
                 "`wifi scan` lists the networks in range; `wifi ap` runs the board's own access point, on demand",
-        .hint = "[on|off] | scan | ap [on|off] [--ssid <ssid>] [--pass <passphrase>]",
+        .hint = "[on|off] | auto [on|off] | scan | ap [on|off] [--ssid <ssid>] [--pass <passphrase>]",
         .func = cmd_wifi_power,
         .argtable = NULL,
     };

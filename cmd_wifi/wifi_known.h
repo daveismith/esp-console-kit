@@ -87,6 +87,15 @@ esp_err_t wifi_known_scan(wifi_known_scan_t *out, size_t max, size_t *found);
 void wifi_known_set_enabled(bool enabled);
 bool wifi_known_is_enabled(void);
 
+/*
+ * `wifi auto on|off`: whether wifi_known_start() rejoins the last network at boot. Kept in
+ * NVS beside the store (key "autojoin"; missing means on). Off, the station still comes up
+ * and can scan, and a join asked for after boot is held and reconnected as usual -- only the
+ * unattended rejoin is skipped. Writes flash: call from a task with an internal stack.
+ */
+esp_err_t wifi_known_set_autojoin(bool on);
+bool wifi_known_autojoin(void);
+
 /* Whether the station is on a network and has an IPv4 address. */
 bool wifi_known_is_connected(void);
 
