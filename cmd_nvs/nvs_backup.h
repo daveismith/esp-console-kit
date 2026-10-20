@@ -56,9 +56,26 @@ extern "C" {
 
 #define NVS_BACKUP_FORMAT 1
 
+/*
+ * A URL fetcher. The kit fetches nothing itself: the application supplies one over its own
+ * HTTP client. It returns a body of at most `max_bytes` that the caller frees with free(),
+ * or an error with `why`; it must not write flash from a PSRAM stack (nor need to).
+ */
+typedef esp_err_t (*nvs_backup_fetch_t)(const char *url, size_t max_bytes, char **body,
+                                        size_t *len, char *why, size_t why_len);
+
 typedef struct {
     const char *part;   /* NULL: NVS_DEFAULT_PART_NAME ("nvs") */
     const char *dir;    /* where `nvs_export <name>` writes ("/data/backup"); NULL: stdout only */
+    /* Optional. Why stdin cannot carry a file right now, or NULL when it can: a console
+     * whose stdin is not the caller's says so here. NULL: stdin is always taken to be the
+     * console's. */
+    const char *(*stdin_refusal)(void);
+    /* Optional. `nvs_import <url>`'s download; NULL: no URL imports. */
+    nvs_backup_fetch_t fetch;
+    /* Optional. A line `nvs_import` prints after a successful import, or NULL for none: the
+     * application's reminder of what a backup never holds (its WiFi networks, say). */
+    const char *(*import_note)(void);
 } nvs_backup_config_t;
 
 /* One rule of the registry. `ns` and `key` may end in '*', a prefix match; `key` NULL means
@@ -125,8 +142,96 @@ int nvs_backup_path(const char *name, char *abs, size_t abs_len, char *why, size
  */
 int nvs_backup_write_file(const char *abs, const char *text, size_t len, char *sha256_hex);
 
-/* The partition and directory to use. register_nvs_backup() (cmd_nvs.h) calls it. */
+/* nvs_backup_export() into `abs` through nvs_backup_write_file(): `len` and `sha256_hex`
+ * (optional) describe the file. ESP_FAIL with info->detail when the write fails. */
+esp_err_t nvs_backup_export_file(const char *abs, size_t *len, char *sha256_hex,
+                                 nvs_backup_export_info_t *info);
+
+/* Zero `n` bytes at `p`, then free() it: for a buffer that may have held a secret. */
+void nvs_backup_wipe_free(void *p, size_t n);
+
+/* The partition, directory and hooks to use (copied). register_nvs_backup() calls it. */
 void nvs_backup_init(const nvs_backup_config_t *cfg);
+
+/* ------------------------------------------------------------------ import */
+
+#define NVS_BACKUP_MAX_FILE  (64 * 1024)        /* the largest file any source may supply */
+#define NVS_BACKUP_SNAPSHOT  "pre-import.r2cfg" /* in the configured directory */
+#define NVS_BACKUP_SNAPSHOT_PREV "pre-import.1.r2cfg" /* the one before, moved aside */
+
+typedef struct {
+    bool dry_run;           /* check and print the diff; write nothing */
+    bool replace;           /* also erase keys of the file's namespaces that it does not hold */
+    bool ignore_excluded;   /* skip excluded entries in the file, rather than refuse it */
+    bool other_board;       /* accept a file whose header names another board */
+    bool no_snapshot;       /* write no NVS_BACKUP_SNAPSHOT first: for when one cannot be
+                             * written (no volume, or a setting the export refuses) */
+} nvs_backup_import_opts_t;
+
+typedef struct {
+    unsigned entries;       /* in the file */
+    unsigned same, changed, added, retyped, removed, excluded;
+    unsigned written;       /* NVS sets and erases made: every one, or those before a failure */
+    bool started;           /* writing began, so a failure left the partition part-imported */
+    bool snapshot;          /* NVS_BACKUP_SNAPSHOT was written before the first change */
+    char detail[128];       /* on a refusal or a failure: why, naming the line or entry */
+} nvs_backup_report_t;
+
+/* One line of the diff or of a refusal's list, without a newline. */
+typedef void (*nvs_backup_line_t)(const char *line, void *ctx);
+
+/*
+ * Import a format-1 file (`opts` required). The whole file is checked before anything is
+ * written: its CRC, its header and entry count, every line's syntax, names, types, values
+ * and sizes, the board it came from, the excluded entries it holds and the partition's free
+ * space; then the diff is computed and told, a line per entry (same, change, add, retype,
+ * remove, excluded/skip), through `line` (optional). Unless it is a dry run, and only when
+ * something differs: NVS_BACKUP_SNAPSHOT is written first (an export of the configuration
+ * as it was, when a directory is configured), then the changes, one commit per namespace.
+ * Unchanged values are not written. An excluded entry is never written, nor erased by `replace`.
+ *
+ * Refused with nothing written (`report->detail` says why): ESP_ERR_INVALID_CRC (a bad or
+ * missing trailer), ESP_ERR_INVALID_VERSION (a newer format), ESP_ERR_INVALID_ARG (a line
+ * that does not parse, a name or value out of range, a count that does not match),
+ * ESP_ERR_INVALID_MAC (another board's file, without other_board), ESP_ERR_NOT_ALLOWED
+ * (excluded entries, without ignore_excluded), ESP_ERR_NVS_NOT_ENOUGH_SPACE, or the
+ * snapshot's own failure (no_snapshot proceeds without one). The snapshot before it is
+ * kept as NVS_BACKUP_SNAPSHOT_PREV. A flash error part-way returns that error with
+ * `started` set and `written` counting what was done; the snapshot holds the state before.
+ *
+ * A module that keeps a RAM copy of its settings may write the old state back over the
+ * import, so the board wants a restart after one. Reads and writes flash: internal stack.
+ */
+esp_err_t nvs_backup_import(const char *text, size_t len, const nvs_backup_import_opts_t *opts,
+                            nvs_backup_report_t *report, nvs_backup_line_t line, void *ctx);
+
+/*
+ * The three sources of a file. Each gives a buffer of at most NVS_BACKUP_MAX_FILE bytes
+ * (PSRAM when there is any) that the caller frees with free(); on a failure, nothing, and
+ * `why` says what went wrong.
+ */
+
+/* A file on the volume (`abs` from nvs_backup_path()). 0 or an errno value. Internal stack. */
+int nvs_backup_read_file(const char *abs, char **text, size_t *len, char *why, size_t why_len);
+
+/*
+ * stdin, read raw (no echo, no line editing) until the `# crc32` line, or refused after
+ * `idle_ms` with no input. The configured stdin_refusal is asked first; then `ready`
+ * (optional) is printed, and a host waits for it before sending, so a refusal never leaves
+ * the file for the console's line reader to run as commands. '\r' and empty lines are
+ * dropped, so a host sending "\r\n", or a console turning '\r' into '\n', delivers the "\n"
+ * file the CRC covers. ESP_OK, ESP_ERR_NOT_SUPPORTED (refused, nothing read),
+ * ESP_ERR_TIMEOUT, ESP_ERR_INVALID_SIZE (over the cap: the input is still drained to its
+ * end) or ESP_ERR_NO_MEM.
+ */
+esp_err_t nvs_backup_read_stdin(const char *ready, int idle_ms, char **text, size_t *len,
+                                char *why, size_t why_len);
+
+/* A URL, through the configured fetcher (ESP_ERR_NOT_SUPPORTED without one). */
+esp_err_t nvs_backup_fetch(const char *url, char **text, size_t *len, char *why, size_t why_len);
+
+/* The configured import note, or NULL. */
+const char *nvs_backup_import_note(void);
 
 #ifdef __cplusplus
 }

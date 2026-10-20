@@ -17,7 +17,8 @@ extern "C" {
 // Register NVS functions
 void register_nvs(void);
 
-// The configuration backup: nvs_backup_init(cfg), then `nvs_inventory` and `nvs_export`
+// The configuration backup: nvs_backup_init(cfg), then `nvs_inventory`, `nvs_export` and
+// `nvs_import`
 void register_nvs_backup(const nvs_backup_config_t *cfg);
 
 #ifdef __cplusplus

@@ -19,6 +19,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "esp_err.h"
+#include "esp_system.h"
 #include "cmd_nvs.h"
 #include "nvs.h"
 #include "nvs_backup.h"
@@ -703,12 +704,15 @@ static int nvs_export_cmd(int argc, char **argv)
             return 1;
         }
     }
-    char *text;
     size_t len;
     nvs_backup_export_info_t info;
-    const esp_err_t err = nvs_backup_export(&text, &len, &info);
+    char sha[65];
+    char *text = NULL;
+    const esp_err_t err = to_file ? nvs_backup_export_file(abs, &len, sha, &info)
+                                  : nvs_backup_export(&text, &len, &info);
     if (err != ESP_OK) {
-        printf("nvs_export: refused: %s\n", info.detail[0] ? info.detail : esp_err_to_name(err));
+        printf("nvs_export: %s%s\n", err == ESP_FAIL ? "" : "refused: ",
+               info.detail[0] ? info.detail : esp_err_to_name(err));
         return 1;
     }
     if (!to_file) {
@@ -716,15 +720,139 @@ static int nvs_export_cmd(int argc, char **argv)
         free(text);
         return 0;
     }
-    char sha[65];
-    const int werr = nvs_backup_write_file(abs, text, len, sha);
-    free(text);
-    if (werr != 0) {
-        printf("nvs_export: %s: %s\n", abs, strerror(werr));
-        return 1;
-    }
     printf("%s: %u bytes, %u entries (%u excluded), sha256 %s\n", abs, (unsigned)len,
            info.entries, info.excluded, sha);
+    return 0;
+}
+
+static struct {
+    struct arg_lit *dry_run;
+    struct arg_lit *replace;
+    struct arg_lit *ignore_excluded;
+    struct arg_lit *other_board;
+    struct arg_lit *no_snapshot;
+    struct arg_lit *restart;
+    struct arg_str *source;
+    struct arg_end *end;
+} import_args;
+
+#define STDIN_IDLE_MS 10000
+#define RESTART_PAUSE_MS 1000
+
+/* A diff line, paced like the rest of the output. */
+static void import_line(const char *line, void *ctx)
+{
+    pace(ctx, printf("%s\n", line));
+}
+
+/* The file from wherever `src` says: '-' (stdin), a URL, or a path. 0, or 1 having said why. */
+static __attribute__((noinline)) int import_source(const char *src, char **text, size_t *len)
+{
+    char why[96];
+    if (strcmp(src, "-") == 0) {
+        const esp_err_t err = nvs_backup_read_stdin(
+            "nvs_import: reading the file from stdin, to its # crc32 line", STDIN_IDLE_MS, text,
+            len, why, sizeof(why));
+        if (err != ESP_OK) {
+            printf("nvs_import: stdin: %s\n", why);
+            return 1;
+        }
+        printf("nvs_import: stdin: %u bytes\n", (unsigned)*len);
+        return 0;
+    }
+    if (strncmp(src, "http://", 7) == 0 || strncmp(src, "https://", 8) == 0) {
+        printf("nvs_import: fetching %s\n", src);
+        fflush(stdout);
+        if (nvs_backup_fetch(src, text, len, why, sizeof(why)) != ESP_OK) {
+            printf("nvs_import: %s\n", why);
+            return 1;
+        }
+        printf("nvs_import: %u bytes\n", (unsigned)*len);
+        return 0;
+    }
+    char abs[FS_ABS_MAX];
+    if (nvs_backup_path(src, abs, sizeof(abs), why, sizeof(why)) != 0 ||
+        nvs_backup_read_file(abs, text, len, why, sizeof(why)) != 0) {
+        printf("nvs_import: %s: %s\n", src, why);
+        return 1;
+    }
+    printf("nvs_import: %s: %u bytes\n", abs, (unsigned)*len);
+    return 0;
+}
+
+static int nvs_import_cmd(int argc, char **argv)
+{
+    /* argtable3 takes a lone "-" for a malformed option, so it is lifted out before the
+     * parse and the source positional is optional; exactly one of them is required. */
+    bool from_stdin = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-") == 0 && !from_stdin) {
+            from_stdin = true;
+            memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(*argv));
+            argc--;
+            i--;
+        }
+    }
+    if (arg_parse(argc, argv, (void **)&import_args) != 0) {
+        arg_print_errors(stderr, import_args.end, argv[0]);
+        return 1;
+    }
+    if (from_stdin == (import_args.source->count > 0)) {
+        printf("nvs_import: give one source: a path, a URL, or - for stdin\n");
+        return 1;
+    }
+    char *text;
+    size_t len;
+    if (import_source(from_stdin ? "-" : import_args.source->sval[0], &text, &len) != 0) {
+        return 1;
+    }
+    const nvs_backup_import_opts_t opts = {
+        .dry_run = import_args.dry_run->count > 0,
+        .replace = import_args.replace->count > 0,
+        .ignore_excluded = import_args.ignore_excluded->count > 0,
+        .other_board = import_args.other_board->count > 0,
+        .no_snapshot = import_args.no_snapshot->count > 0,
+    };
+    nvs_backup_report_t r;
+    size_t paced = 0;
+    const esp_err_t err = nvs_backup_import(text, len, &opts, &r, import_line, &paced);
+    nvs_backup_wipe_free(text, len);    /* a refused file may have held an excluded entry */
+    if (err != ESP_OK && !r.started) {
+        printf("nvs_import: refused, nothing written: %s\n", r.detail);
+        return 1;
+    }
+    printf("%u entries: %u same, %u changed, %u added, %u retyped, %u removed, %u excluded\n",
+           r.entries, r.same, r.changed, r.added, r.retyped, r.removed, r.excluded);
+    if (err != ESP_OK) {
+        printf("nvs_import: FAILED after %u writes: %s\n", r.written, r.detail);
+        if (r.snapshot) {
+            printf("nvs_import: " NVS_BACKUP_SNAPSHOT " in the backup directory holds the "
+                   "configuration as it was: nvs_import " NVS_BACKUP_SNAPSHOT " puts it back\n");
+        }
+        return 1;
+    }
+    if (opts.dry_run) {
+        printf("dry run: nothing written\n");
+    } else if (r.written == 0) {
+        printf("nothing to change: nothing written\n");
+    } else {
+        printf("%u written%s; restart required, since a module may hold the old settings in "
+               "RAM and write them back\n",
+               r.written, r.snapshot ? ", the state before in " NVS_BACKUP_SNAPSHOT : "");
+    }
+    const char *note = nvs_backup_import_note();
+    if (note != NULL) {
+        printf("%s\n", note);
+    }
+    if (import_args.restart->count > 0 && !opts.dry_run && r.written > 0) {
+        printf("restarting\n");
+        fflush(stdout);
+        /* A second for the output, and for the import's log record to reach wherever the
+         * application keeps its log: r2_domeplayer's event store pumps every 250 ms, and a
+         * 100 ms pause lost the record on the bench. */
+        vTaskDelay(pdMS_TO_TICKS(RESTART_PAUSE_MS));
+        esp_restart();
+    }
     return 0;
 }
 
@@ -760,6 +888,38 @@ void register_nvs_backup(const nvs_backup_config_t *cfg)
         .func = &nvs_export_cmd,
         .argtable = &export_args,
     };
+    import_args.dry_run = arg_lit0("n", "dry-run",
+                                   "check the file and print the diff; write nothing");
+    import_args.replace = arg_lit0(NULL, "replace",
+                                   "also erase what the file's namespaces hold and it does not");
+    import_args.ignore_excluded = arg_lit0(NULL, "ignore-excluded",
+                                           "skip excluded entries in the file, not refuse it");
+    import_args.other_board = arg_lit0(NULL, "other-board", "accept another board's file");
+    import_args.no_snapshot = arg_lit0(NULL, "no-snapshot",
+                                       "write no " NVS_BACKUP_SNAPSHOT " first");
+    import_args.restart = arg_lit0("r", "restart",
+                                   "restart once the import has written something");
+    import_args.source = arg_str0(NULL, NULL, "<path|url|->",
+                                  "a name in the backup directory, a path from /, an http(s) URL, "
+                                  "or - for the file on stdin");
+    import_args.end = arg_end(2);
+    const esp_console_cmd_t import_cmd = {
+        .command = "nvs_import",
+        .help = "Restore a .r2cfg file. The whole file is checked first -- CRC, header, every "
+                "line, the board, excluded entries, free space -- and refused with nothing "
+                "written if any of it fails; then the diff is printed, " NVS_BACKUP_SNAPSHOT
+                " is written, and only what differs is written. Merges unless --replace. "
+                "Excluded keys are never written. Restart afterwards (-r).\n"
+                "Examples:\n"
+                " nvs_import -n panel.r2cfg               (the diff only)\n"
+                " nvs_import -r /backup/a.r2cfg\n"
+                " nvs_import http://10.0.0.1:8000/a.r2cfg\n"
+                " nvs_import -                            (the file follows on stdin)",
+        .hint = NULL,
+        .func = &nvs_import_cmd,
+        .argtable = &import_args,
+    };
     ESP_ERROR_CHECK(esp_console_cmd_register(&inventory_cmd));
     ESP_ERROR_CHECK(esp_console_cmd_register(&export_cmd));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&import_cmd));
 }
