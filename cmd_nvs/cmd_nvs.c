@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include "esp_log.h"
@@ -703,6 +704,15 @@ static int nvs_export_cmd(int argc, char **argv)
             printf("nvs_export: %s\n", why);
             return 1;
         }
+        /* The import's undo files are the import's to write: an export over one would
+         * replace the state before a failed import with the state after it. */
+        const char *base = strrchr(abs, '/') != NULL ? strrchr(abs, '/') + 1 : abs;
+        if (strcasecmp(base, NVS_BACKUP_SNAPSHOT) == 0 ||
+            strcasecmp(base, NVS_BACKUP_SNAPSHOT_PREV) == 0 ||
+            strcasecmp(base, NVS_BACKUP_SNAPSHOT_NEXT) == 0) {
+            printf("nvs_export: %s is nvs_import's snapshot: choose another name\n", base);
+            return 1;
+        }
     }
     size_t len;
     nvs_backup_export_info_t info;
@@ -711,7 +721,10 @@ static int nvs_export_cmd(int argc, char **argv)
     const esp_err_t err = to_file ? nvs_backup_export_file(abs, &len, sha, &info)
                                   : nvs_backup_export(&text, &len, &info);
     if (err != ESP_OK) {
-        printf("nvs_export: %s%s\n", err == ESP_FAIL ? "" : "refused: ",
+        /* "refused" is a verdict on the configuration, which a host does not retry; out of
+         * memory or an NVS error is not one. */
+        const bool refused = err == ESP_ERR_NOT_ALLOWED || err == ESP_ERR_NOT_SUPPORTED;
+        printf("nvs_export: %s%s\n", refused ? "refused: " : "failed: ",
                info.detail[0] ? info.detail : esp_err_to_name(err));
         return 1;
     }
@@ -847,9 +860,8 @@ static int nvs_import_cmd(int argc, char **argv)
     if (import_args.restart->count > 0 && !opts.dry_run && r.written > 0) {
         printf("restarting\n");
         fflush(stdout);
-        /* A second for the output, and for the import's log record to reach wherever the
-         * application keeps its log: r2_domeplayer's event store pumps every 250 ms, and a
-         * 100 ms pause lost the record on the bench. */
+        /* A second for the output, and for an application that persists its log
+         * asynchronously to keep the import's record: 100 ms lost it on the bench. */
         vTaskDelay(pdMS_TO_TICKS(RESTART_PAUSE_MS));
         esp_restart();
     }

@@ -8,7 +8,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_system` | `register_system_common()`, `register_gpio(table, n)`, `register_system_deep_sleep()`, `register_system_light_sleep()` | `version` `restart` `free` `heap` `membench` `flash-stats` `tasks` `top` `log_level` `gpio` `deep_sleep` `light_sleep` |
 | `cmd_wifi` | `register_wifi()`, `wifi_known_register_commands()` + `wifi_known_start()`; `wifi_ap_start()`/`wifi_ap_stop()` | `join` `wifi_txpower` `wifi_link` `wifi_ps`, and saved networks: `wifi [on\|off]` `wifi_save` `wifi_forget` `wifi_known`; the access point: `wifi ap [on\|off] [--ssid] [--pass]` |
 | `cmd_network` | `register_network_commands()` | `ip addr` `ping` `iperf` `traceroute` `dig` |
-| `cmd_nvs` | `register_nvs()` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list` |
+| `cmd_nvs` | `register_nvs()`; `register_nvs_backup(&cfg)` and `nvs_backup_exclude(ns, key, reason)` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list`, and configuration backup: `nvs_inventory` `nvs_export` `nvs_import` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
 | `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h`; `fs_ops.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
 | `web_api` | `web_fs_register()`, `web_servo_register(before_move)`, `web_net_register()` | HTTP: `/api/v1/fs*` (the volume: list, stat, upload, download, move, copy, delete); `/api/v1/servos*` (positions, moves, calibration, drive policy); `/api/v1/network*` (the link, known networks, scan, join, the access point) |
@@ -35,6 +35,16 @@ Notes:
   application reports it. It needs NVS and the default event loop before
   `wifi_known_start()`.
 
+- `nvs_backup` (in `cmd_nvs`) exports the whole NVS partition as a typed text file with a
+  CRC-32 trailer and imports it back, checking the whole file before the first write. It walks
+  every namespace, so a new key is backed up with no code change; what stays out is an
+  exclusion. The kit excludes IDF's internals and the credentials its own components keep
+  (`wifi_known`'s networks, `wifi_ap`, `web/password`); an application adds its own with
+  `nvs_backup_exclude()` before `register_nvs_backup()`. A credential is always excluded, by
+  whoever adds it. `nvs_inventory` shows each entry's verdict; `nvs_export [file]` prints or
+  writes to `nvs_backup_config_t.dir`; `nvs_import <file|url|->` takes a file there, a URL
+  through the config's `fetch` hook, or the file on stdin (`stdin_refusal` says when it
+  can't), snapshots to `pre-import.r2cfg` first, and wants a restart after.
 - `cmd_fs` works on any mounted VFS volume. `cmd_fs_config_t` gives it the mount
   point, an optional total/used callback for `df` (such as `esp_littlefs_info()`),
   and the UART used for transfers (the console UART by default). Paths are

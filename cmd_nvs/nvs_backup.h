@@ -39,7 +39,7 @@
  *
  * INTERNAL STACKS ONLY: the inventory and the export read NVS and nvs_backup_write_file()
  * writes flash, and either disables the cache, which a task on a PSRAM stack cannot survive.
- * The console and telnet tasks qualify; a caller on a PSRAM stack (the ROS task, for one)
+ * The console and telnet tasks qualify; a task on a PSRAM stack
  * hops to an internal one first. Large buffers are PSRAM when there is PSRAM, one allocation
  * each rather than one per entry; the stack use is small enough for a 6 KB console task.
  */
@@ -158,6 +158,7 @@ void nvs_backup_init(const nvs_backup_config_t *cfg);
 #define NVS_BACKUP_MAX_FILE  (64 * 1024)        /* the largest file any source may supply */
 #define NVS_BACKUP_SNAPSHOT  "pre-import.r2cfg" /* in the configured directory */
 #define NVS_BACKUP_SNAPSHOT_PREV "pre-import.1.r2cfg" /* the one before, moved aside */
+#define NVS_BACKUP_SNAPSHOT_NEXT "pre-import.new.r2cfg" /* written first, then renamed */
 
 typedef struct {
     bool dry_run;           /* check and print the diff; write nothing */

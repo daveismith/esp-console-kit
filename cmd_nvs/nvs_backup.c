@@ -1,5 +1,6 @@
 /*
- * nvs_backup: the exclusion registry, the inventory and the export. See nvs_backup.h.
+ * nvs_backup: the exclusion registry, the inventory, the export, and the import with its
+ * parse, check, diff, snapshot and writes, from a file, a URL or stdin. See nvs_backup.h.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -899,7 +900,7 @@ static bool parse_int(const char *s, size_t n, nvs_type_t type, int64_t *v)
 /* A name of [s, s+n) into out (NVS's 16 bytes), checked as the export checks it. */
 static bool take_name(const char *s, size_t n, bool is_key, char out[NVS_KEY_NAME_MAX_SIZE])
 {
-    if (n == 0 || n >= NVS_KEY_NAME_MAX_SIZE) {
+    if (n == 0 || n >= NVS_KEY_NAME_MAX_SIZE || memchr(s, '\0', n) != NULL) {
         return false;
     }
     memcpy(out, s, n);
@@ -1045,6 +1046,7 @@ static NOINLINE esp_err_t parse(const char *text, size_t len, parsed_t *p,
     p->dcap = len + 1;
     p->data = big_realloc(NULL, p->dcap);
     if (p->data == NULL) {
+        snprintf(r->detail, sizeof(r->detail), "out of memory for %u bytes", (unsigned)p->dcap);
         return ESP_ERR_NO_MEM;
     }
     char ns[NVS_NS_NAME_MAX_SIZE] = "";
@@ -1506,22 +1508,30 @@ static NOINLINE esp_err_t snapshot(nvs_backup_report_t *r)
         return ESP_OK;      /* stdout only: there is nowhere to put one */
     }
     char abs[FS_ABS_MAX];
+    char prev[FS_ABS_MAX];
+    char next[FS_ABS_MAX];
     char why[64];
-    if (nvs_backup_path(NVS_BACKUP_SNAPSHOT, abs, sizeof(abs), why, sizeof(why)) != 0) {
+    if (nvs_backup_path(NVS_BACKUP_SNAPSHOT, abs, sizeof(abs), why, sizeof(why)) != 0 ||
+        nvs_backup_path(NVS_BACKUP_SNAPSHOT_PREV, prev, sizeof(prev), why, sizeof(why)) != 0 ||
+        nvs_backup_path(NVS_BACKUP_SNAPSHOT_NEXT, next, sizeof(next), why, sizeof(why)) != 0) {
         snprintf(r->detail, sizeof(r->detail),
                  "the pre-import snapshot: %s (--no-snapshot goes without)", why);
         return ESP_FAIL;
     }
-    /* The previous snapshot moves aside rather than being overwritten: when it is the file
-     * being imported -- the undo of a failed import -- it is the only copy of the state
+    /* Written under a third name first, so a snapshot that fails costs neither old one. Only
+     * then does the previous one move aside rather than being overwritten: when it is the
+     * file being imported -- the undo of a failed import -- it is the only copy of the state
      * before, until this import succeeds. */
-    char prev[FS_ABS_MAX];
-    if (nvs_backup_path(NVS_BACKUP_SNAPSHOT_PREV, prev, sizeof(prev), why, sizeof(why)) == 0) {
-        fs_move(abs, prev, true);   /* ENOENT on a first import, which is fine */
-    }
     size_t len;
     nvs_backup_export_info_t info;
-    const esp_err_t err = nvs_backup_export_file(abs, &len, NULL, &info);
+    esp_err_t err = nvs_backup_export_file(next, &len, NULL, &info);
+    if (err == ESP_OK) {
+        fs_move(abs, prev, true);   /* ENOENT on a first import, which is fine */
+        if (fs_move(next, abs, true) != 0) {
+            snprintf(info.detail, sizeof(info.detail), "renaming %s", NVS_BACKUP_SNAPSHOT_NEXT);
+            err = ESP_FAIL;
+        }
+    }
     if (err != ESP_OK) {
         snprintf(r->detail, sizeof(r->detail),
                  "the pre-import snapshot failed: %.64s (--no-snapshot goes without)",
@@ -1717,9 +1727,11 @@ esp_err_t nvs_backup_read_stdin(const char *ready, int idle_ms, char **text, siz
                 break;
             }
             if (xTaskGetTickCount() - last >= pdMS_TO_TICKS(idle_ms)) {
-                snprintf(why, why_len, "%d s with no input%s", idle_ms / 1000,
-                         t.len > 0 ? ", and no \"# crc32\" line: truncated" : "");
-                err = ESP_ERR_TIMEOUT;
+                if (err == ESP_OK) {    /* else keep the refusal the drain was waiting out */
+                    snprintf(why, why_len, "%d s with no input%s", idle_ms / 1000,
+                             t.len > 0 ? ", and no \"# crc32\" line: truncated" : "");
+                    err = ESP_ERR_TIMEOUT;
+                }
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(10));
