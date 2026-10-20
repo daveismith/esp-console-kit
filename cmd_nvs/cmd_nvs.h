@@ -8,12 +8,17 @@
 */
 #pragma once
 
+#include "nvs_backup.h"   /* nvs_backup_config_t, nvs_backup_exclude() */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // Register NVS functions
 void register_nvs(void);
+
+// The configuration backup: nvs_backup_init(cfg), then `nvs_inventory` and `nvs_export`
+void register_nvs_backup(const nvs_backup_config_t *cfg);
 
 #ifdef __cplusplus
 }

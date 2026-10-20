@@ -27,6 +27,8 @@
 
 static const char *TAG = "wifi_ap";
 
+/* Excluded from every configuration backup by name in cmd_nvs/nvs_backup.c (s_kit): it holds
+ * the passphrase. Rename it there too. */
 #define NVS_NS "wifi_ap"
 #define AP_IFKEY "WIFI_AP_DEF"
 

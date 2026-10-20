@@ -48,6 +48,8 @@ static const char *TAG = "wifi_known";
 #define SSID_LEN      33   /* 32 + NUL, the 802.11 maximum */
 #define PASS_LEN      64   /* 63 + NUL, the WPA2 maximum */
 #define KNOWN_MAX     16
+/* Excluded from every configuration backup by name in cmd_nvs/nvs_backup.c (s_kit): it holds
+ * passphrases. Rename it there too. */
 #define KNOWN_KEY     "known"
 #define KNOWN_VERSION 1u
 /* Its own key rather than a field in the blob, so the blob keeps its size and version. */

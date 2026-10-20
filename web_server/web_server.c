@@ -55,6 +55,8 @@
 
 static const char *TAG = "web";
 
+/* Its "password" key is excluded from every configuration backup by name in
+ * cmd_nvs/nvs_backup.c (s_kit). Rename it there too. */
 #define NVS_NS "web"
 #define MAX_FEATURES 16
 
