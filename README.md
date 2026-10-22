@@ -10,7 +10,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_network` | `register_network_commands()` | `ip addr` `ping` `iperf` `traceroute` `dig` |
 | `cmd_nvs` | `register_nvs()`; `register_nvs_backup(&cfg)` and `nvs_backup_exclude(ns, key, reason)` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list`, and configuration backup: `nvs_inventory` `nvs_export` `nvs_import` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
-| `i2c_bus_guard` | nothing: require it; `i2c_bus_guard_stale_cleared()` counts what it caught | none: a link-time patch for IDF 6.1.0's `i2c_master` |
+| `i2c_bus_guard` | nothing: require it (`cmd_i2c` and `servo` do on IDF 6.1.0, any target but the original ESP32); `i2c_bus_guard_stale_cleared()` counts what it caught | none: a link-time patch for IDF 6.1.0's `i2c_master` |
 | `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h`; `fs_ops.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
 | `web_api` | `web_fs_register()`, `web_servo_register(before_move)`, `web_net_register()` | HTTP: `/api/v1/fs*` (the volume: list, stat, upload, download, move, copy, delete); `/api/v1/servos*` (positions, moves, calibration, drive policy); `/api/v1/network*` (the link, known networks, scan, join, the access point) |
 | `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname` `web cors`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, `/api/v1/web`, `/api/v1/events`, and `/api/v1/ota*` |
@@ -59,8 +59,15 @@ Notes:
   between. A bus with a transaction queue is left alone (its reads return once queued, so
   the state may be a read still in flight). It reads the driver's private struct and
   refuses to build against any IDF but 6.1.0, or for the original ESP32; delete it once
-  IDF's probe resets that state itself. The kit's `cmd_i2c` and `servo` do not require it,
-  so they still build on other IDFs: an application on 6.1.0 that probes requires it.
+  IDF's probe resets that state itself. The kit's own probing components, `cmd_i2c` and
+  `servo`, require it on exactly the builds that have the bug (`i2c_bus_guard/wanted.cmake`:
+  IDF 6.1.0, not the original ESP32), so a firmware using either is covered with no change
+  and builds on any other IDF as before; a newer IDF gets a configure warning to check the
+  driver again. They require it only when it is registered, so a project that registers the
+  kit's directories one by one must list `i2c_bus_guard` among them, and one that takes
+  `cmd_i2c` or `servo` from the component manager on its own must require it itself. Any
+  other firmware on 6.1.0 that probes requires it. A firmware that wants a newer IDF to stop
+  at the guard's `#error`, rather than build on unguarded, lists it in its own requirements.
 - `cmd_fs` works on any mounted VFS volume. `cmd_fs_config_t` gives it the mount
   point, an optional total/used callback for `df` (such as `esp_littlefs_info()`),
   and the UART used for transfers (the console UART by default). Paths are

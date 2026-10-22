@@ -54,6 +54,7 @@
  * i2c_master.c's i2c_master_probe() and the ISR's receive path, then move this line -- or
  * delete the component, if the probe resets the read state itself (or clears it on every
  * error) by then. */
+/* wanted.cmake repeats both conditions, for cmd_i2c and servo: change the two together. */
 #if ESP_IDF_VERSION != ESP_IDF_VERSION_VAL(6, 1, 0)
 #error "i2c_bus_guard.c was verified against IDF 6.1.0's i2c_master; check it against this one"
 #endif
