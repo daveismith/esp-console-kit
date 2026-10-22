@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "A link-time patch for ESP-IDF 6.1.0's i2c_master: a probe after a timed-out read writes through a stale pointer, and the guard clears that state first"
+url: https://github.com/daveismith/esp-console-kit
+dependencies:
+  idf: ">=6.0"   # like the rest of the kit; the source refuses all but 6.1.0 itself

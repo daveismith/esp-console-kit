@@ -10,6 +10,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `cmd_network` | `register_network_commands()` | `ip addr` `ping` `iperf` `traceroute` `dig` |
 | `cmd_nvs` | `register_nvs()`; `register_nvs_backup(&cfg)` and `nvs_backup_exclude(ns, key, reason)` | `nvs_set` `nvs_get` `nvs_erase` `nvs_erase_namespace` `nvs_namespace` `nvs_list`, and configuration backup: `nvs_inventory` `nvs_export` `nvs_import` |
 | `cmd_i2c` | `register_i2ctools()` | `i2cconfig` `i2cdetect` `i2cget` `i2cset` `i2cdump` |
+| `i2c_bus_guard` | nothing: require it; `i2c_bus_guard_stale_cleared()` counts what it caught | none: a link-time patch for IDF 6.1.0's `i2c_master` |
 | `cmd_fs` | `register_fs(&cfg)`; `register_ota(uart)` and `ota_confirm_running()`; `ota_core.h`; `fs_ops.h` | `fs ls` `df` `stat` `mkdir` `rmdir` `rm` `mv` `cat` `hexdump` `sha256` `bench`, and `put`/`get` over XMODEM-1K; `ota` (the app slots), `ota put` (a new image over XMODEM-1K), `ota pull` (one from a URL, with `web_server`) and `ota activate` |
 | `web_api` | `web_fs_register()`, `web_servo_register(before_move)`, `web_net_register()` | HTTP: `/api/v1/fs*` (the volume: list, stat, upload, download, move, copy, delete); `/api/v1/servos*` (positions, moves, calibration, drive policy); `/api/v1/network*` (the link, known networks, scan, join, the access point) |
 | `web_server` | `web_server_start(&cfg)`, `web_register()`, `web_ota_register()`, `web_server_register_commands()` | `web [on\|off]` `web password` `web hostname` `web cors`; HTTP: `/api/v1/info`, `/api/v1/restart`, `/api/v1/openapi.json`, `/api/v1/web`, `/api/v1/events`, and `/api/v1/ota*` |
@@ -45,6 +46,21 @@ Notes:
   writes to `nvs_backup_config_t.dir`; `nvs_import <file|url|->` takes a file there, a URL
   through the config's `fetch` hook, or the file on stdin (`stdin_refusal` says when it
   can't), snapshots to `pre-import.r2cfg` first, and wants a restart after.
+- `i2c_bus_guard` patches a memory-corruption bug in IDF 6.1.0's `i2c_master`: a read that
+  ends in a timeout or lost arbitration (a target stretching SCL too long, a line held low)
+  leaves its state on the bus, and the next `i2c_master_probe()` copies RX FIFO bytes through
+  a stale pointer into whatever the probing task's stack held -- a write somewhere random,
+  then a panic somewhere else. Any firmware that probes (a driver looking for a device that
+  may be absent, `i2cdetect`, the servo attach) on a bus where something also reads is
+  exposed. The component wraps `i2c_master_probe`, `_receive`, `_transmit_receive` and
+  `_execute_defined_operations` at link time (`--wrap`, INTERFACE options, linked whole), so
+  every call in the image goes through it and none need change: a probe clears the stale
+  state first, and probes and reads share a mutex per bus so no failed read slips in
+  between. A bus with a transaction queue is left alone (its reads return once queued, so
+  the state may be a read still in flight). It reads the driver's private struct and
+  refuses to build against any IDF but 6.1.0, or for the original ESP32; delete it once
+  IDF's probe resets that state itself. The kit's `cmd_i2c` and `servo` do not require it,
+  so they still build on other IDFs: an application on 6.1.0 that probes requires it.
 - `cmd_fs` works on any mounted VFS volume. `cmd_fs_config_t` gives it the mount
   point, an optional total/used callback for `df` (such as `esp_littlefs_info()`),
   and the UART used for transfers (the console UART by default). Paths are
