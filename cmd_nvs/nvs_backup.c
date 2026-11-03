@@ -667,7 +667,9 @@ static int format_header(char *out, size_t size, unsigned entries)
 {
     uint8_t mac[6];
     char board[18] = "unknown";
-    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+    /* The base MAC, which is the station MAC on every chip with a radio and the only one
+     * a chip without a radio has (the ESP32-P4): the same bytes either way. */
+    if (esp_read_mac(mac, ESP_MAC_BASE) == ESP_OK) {
         snprintf(board, sizeof(board), MACSTR, MAC2STR(mac));
     }
     char when[24] = "unknown";
@@ -1435,7 +1437,7 @@ static NOINLINE esp_err_t check(parsed_t *p, const nvs_backup_import_opts_t *o,
     }
 
     uint8_t mac[6];
-    const bool mine = p->board_known && esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK &&
+    const bool mine = p->board_known && esp_read_mac(mac, ESP_MAC_BASE) == ESP_OK &&
                       memcmp(mac, p->board, sizeof(mac)) == 0;
     if (!mine && !o->other_board) {
         if (p->board_known) {
