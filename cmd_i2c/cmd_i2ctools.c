@@ -30,7 +30,7 @@ static const char *TAG = "cmd_i2ctools";
 
 /* The port the application is expected to have put its board bus on. A session
  * can attach elsewhere with `i2cconfig --port`. */
-#define I2C_TOOL_DEFAULT_PORT     (0)
+#define I2C_TOOL_DEFAULT_PORT     (CONFIG_CMD_I2C_DEFAULT_PORT)
 
 /* Largest -l/-d payload a single command will handle. */
 #define I2C_TOOL_MAX_DATA_LEN     (256)

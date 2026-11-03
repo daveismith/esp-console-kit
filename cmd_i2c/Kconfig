@@ -1,0 +1,13 @@
+menu "I2C tools (cmd_i2c)"
+
+    config CMD_I2C_DEFAULT_PORT
+        int "I2C port the i2c commands use until i2cconfig says otherwise"
+        range 0 2
+        default 0
+        help
+            `i2cdetect`, `i2cget`, `i2cset` and `i2cdump` borrow the application's master
+            bus on this port if it exists when they first run; `i2cconfig --port` changes
+            it at run time. A board whose peripherals are not on port 0 (the ESP32-P4 dome
+            panel keeps its droid devices on I2C1) sets this so the tools look there.
+
+endmenu
