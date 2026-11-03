@@ -82,6 +82,18 @@ void wifi_bringup(void)
     assert(sta_netif);
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
+    /*
+     * The factory MACs, taken now. On a remote radio wifi_factory_mac() keeps the first
+     * MAC the co-processor reports, which is the factory one only if no override has run
+     * yet -- and the earliest point anything could override it is after this call. On a
+     * native radio it reads the efuse and this costs nothing. A failure here leaves it to
+     * try again on first use, as before.
+     */
+    {
+        uint8_t mac[6];
+        (void)wifi_factory_mac(WIFI_IF_STA, mac);
+        (void)wifi_factory_mac(WIFI_IF_AP, mac);
+    }
     ESP_ERROR_CHECK( esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &event_handler, NULL) );
     ESP_ERROR_CHECK( esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL) );
     ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );

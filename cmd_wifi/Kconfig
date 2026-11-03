@@ -13,8 +13,18 @@ config CMD_WIFI_KNOWN_NVS_NAMESPACE
         blob is keyed on it (2026-11-03: an ESP32-P4 build with no WiFi exported a
         saved network because this symbol did not exist there).
 
+# The one place the three radio symbols are combined: a native radio (ESP_WIFI_ENABLED), a
+# host radio (ESP_HOST_WIFI_ENABLED), or IDF 6.1's Wi-Fi Remote with esp_hosted behind it
+# (ESP_WIFI_REMOTE_ENABLED). Everything that asks "is there a radio?" asks this.
+config CMD_WIFI_HAS_RADIO
+    bool
+    default y if ESP_WIFI_ENABLED || ESP_HOST_WIFI_ENABLED || ESP_WIFI_REMOTE_ENABLED
+    help
+        Set when the build has a WiFi radio of any kind: native, host, or remote
+        (esp_wifi_remote over esp_hosted). The one place the three symbols are combined.
+
 menu "Console WiFi commands (cmd_wifi)"
-    depends on ESP_WIFI_ENABLED || ESP_HOST_WIFI_ENABLED || ESP_WIFI_REMOTE_ENABLED
+    depends on CMD_WIFI_HAS_RADIO
 
     config CMD_WIFI_KNOWN_FAST_RETRIES
         int "Immediate reconnect attempts after the link drops"
