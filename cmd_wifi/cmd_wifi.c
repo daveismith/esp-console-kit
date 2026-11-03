@@ -358,3 +358,24 @@ void register_wifi(void)
 
     ESP_ERROR_CHECK( esp_console_cmd_register(&ps_cmd) );
 }
+
+bool wifi_factory_mac(wifi_interface_t ifx, uint8_t mac[6])
+{
+#if CONFIG_ESP_WIFI_ENABLED
+    return esp_read_mac(mac, ifx == WIFI_IF_AP ? ESP_MAC_WIFI_SOFTAP : ESP_MAC_WIFI_STA) == ESP_OK;
+#else
+    /* A remote radio: the co-processor's own MAC, read once before anything overrides it.
+     * esp_read_mac() would fault here ("mac type is incorrect"), so it is never asked. */
+    static uint8_t s_factory[2][6];
+    static bool s_known[2];
+    const int i = (ifx == WIFI_IF_AP) ? 1 : 0;
+    if (!s_known[i]) {
+        if (esp_wifi_get_mac(ifx, s_factory[i]) != ESP_OK) {
+            return false;
+        }
+        s_known[i] = true;
+    }
+    memcpy(mac, s_factory[i], 6);
+    return true;
+#endif
+}

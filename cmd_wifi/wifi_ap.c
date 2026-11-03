@@ -42,7 +42,7 @@ static int64_t s_off_at_us;         /* when, by esp_timer_get_time(); 0 stays on
 void wifi_ap_default_name(const char *prefix, char *out, size_t out_len)
 {
     uint8_t mac[6] = { 0 };
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    wifi_factory_mac(WIFI_IF_STA, mac);   /* the station's, so the name matches its MAC */
     snprintf(out, out_len, "%s-%02x%02x", prefix, mac[4], mac[5]);
 }
 

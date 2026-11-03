@@ -14,7 +14,7 @@ config CMD_WIFI_KNOWN_NVS_NAMESPACE
         saved network because this symbol did not exist there).
 
 menu "Console WiFi commands (cmd_wifi)"
-    depends on ESP_WIFI_ENABLED || ESP_HOST_WIFI_ENABLED
+    depends on ESP_WIFI_ENABLED || ESP_HOST_WIFI_ENABLED || ESP_WIFI_REMOTE_ENABLED
 
     config CMD_WIFI_KNOWN_FAST_RETRIES
         int "Immediate reconnect attempts after the link drops"

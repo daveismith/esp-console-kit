@@ -1,4 +1,4 @@
-if(CONFIG_ESP_WIFI_ENABLED OR CONFIG_ESP_HOST_WIFI_ENABLED)
+if(CONFIG_ESP_WIFI_ENABLED OR CONFIG_ESP_HOST_WIFI_ENABLED OR CONFIG_ESP_WIFI_REMOTE_ENABLED)
     set(srcs "cmd_wifi.c" "wifi_known.c" "wifi_ap.c")
 else()
     set(srcs)
