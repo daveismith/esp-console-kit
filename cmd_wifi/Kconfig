@@ -1,13 +1,20 @@
+# The saved networks' namespace is a fact about the board's NVS, radio or no radio: the
+# configuration backup (cmd_nvs/nvs_backup.c) excludes the credential blob by this name on
+# every build, and a firmware built without WiFi still imports and exports the NVS that a
+# WiFi build of the same board wrote. So it is NOT under the menu's radio gate below.
+config CMD_WIFI_KNOWN_NVS_NAMESPACE
+    string "NVS namespace for saved WiFi networks"
+    default "wifi_known"
+    help
+        NVS namespace holding the saved-network blob (key "known"). At most 15
+        characters. r2_domeplayer's store used "r2net"; the blob layout is the same,
+        so setting this to "r2net" keeps a board's saved networks across the switch.
+        Visible without a radio because the configuration backup's exclusion of the
+        blob is keyed on it (2026-11-03: an ESP32-P4 build with no WiFi exported a
+        saved network because this symbol did not exist there).
+
 menu "Console WiFi commands (cmd_wifi)"
     depends on ESP_WIFI_ENABLED || ESP_HOST_WIFI_ENABLED
-
-    config CMD_WIFI_KNOWN_NVS_NAMESPACE
-        string "NVS namespace for saved networks"
-        default "wifi_known"
-        help
-            NVS namespace holding the saved-network blob (key "known"). At most 15
-            characters. r2_domeplayer's store used "r2net"; the blob layout is the same,
-            so setting this to "r2net" keeps a board's saved networks across the switch.
 
     config CMD_WIFI_KNOWN_FAST_RETRIES
         int "Immediate reconnect attempts after the link drops"
