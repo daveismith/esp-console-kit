@@ -117,7 +117,9 @@ Notes:
     with its own head and keeps the socket, and events are written to it later from the
     server's task (`httpd_queue_work()`), without waiting: a client that can't take them is
     closed, and its `EventSource` comes back. `CONFIG_WEB_SERVER_MAX_STREAMS` (3) at once; a
-    heartbeat every 15 s. Without `Accept: text/event-stream`, the kept happenings as JSON.
+    heartbeat every 15 s. Without `Accept: text/event-stream`, the kept happenings as JSON, sent
+    in chunks as they are stored (`events_open()`, `events_next()`), never parsed back into one
+    tree: a few KB of internal RAM at most, however many are kept.
   - `web_ota_register()` adds the `/api/v1/ota` routes over `ota_core`: upload (PUT,
     streamed, a long operation), session state, slots, activate, discard, pull, check.
   - `ota_pull` downloads an image from a URL or a release manifest (`parts[]` with `role:
@@ -128,7 +130,8 @@ Notes:
   declared with a builder, the JSON its GET returns, and its owner calls `events_changed()`: a
   listener is only marked, and builds the latest state when it sends, so a burst is one event. A
   *happening* (`events_happened()`) is numbered (`seq`), stamped and kept, the last 32, so a
-  listener can catch up with `events_since()`. `web_server` streams them; `web_ota` publishes the
+  listener can catch up with `events_since()`, or one at a time with `events_open()` and
+  `events_next()`, for a reply sent in pieces with the ring unlocked between them. `web_server` streams them; `web_ota` publishes the
   update session (`ota`), `web_net` the network (`network`), and the web server `system` (uptime,
   memory, signal) every 15 s.
 - `wifi_known` also lists the stored networks (`wifi_known_list()`), stores one without joining

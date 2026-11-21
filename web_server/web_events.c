@@ -1,6 +1,6 @@
 /*
  * GET /api/v1/events: the board's events (components `events`), as Server-Sent Events, or the
- * kept happenings as JSON.
+ * kept happenings as JSON (send_history(), in chunks).
  *
  * A stream is a connection the handler answers with its own head -- text/event-stream, no
  * length -- and then keeps: the server goes on to other requests, and events are written to
@@ -240,18 +240,58 @@ static void heartbeat(void *arg)
 
 /* ------------------------------------------------------------------ the route */
 
+/*
+ * The kept happenings as JSON, {"seq":..,"lost":..,"events":[..]}, sent in chunks of a few, each
+ * copied from the ring as it is stored -- the text events_happened() printed, so the reply is
+ * what a cJSON tree of them would print -- with the ring locked only while one is copied. Parsing
+ * all 32 back into a tree and printing it whole took 16-18 KB of internal RAM at the peak (holo
+ * board, 2026-11-21: where its low-water mark was set); this takes a chunk and one happening.
+ */
+#define HISTORY_CHUNK 1024
+
 typedef struct {
-    cJSON *events;
+    text_t text;
+    bool any;
 } history_t;
 
 static void add_json(uint16_t seq, events_mask_t bit, const char *json, void *ctx)
 {
     (void)seq;
     (void)bit;
-    cJSON *e = cJSON_Parse(json);
-    if (e != NULL) {
-        cJSON_AddItemToArray(((history_t *)ctx)->events, e);
+    history_t *h = ctx;
+    append(&h->text, "%s%s", h->any ? "," : "", json);
+    h->any = true;
+}
+
+static esp_err_t send_history(httpd_req_t *req, uint16_t after, events_mask_t mask)
+{
+    events_cursor_t cursor;
+    uint32_t lost = 0;
+    const uint16_t seq = events_open(after, mask, &cursor, &lost);
+    history_t h = { 0 };
+    append(&h.text, "{\"seq\":%u,\"lost\":%lu,\"events\":[", (unsigned)seq, (unsigned long)lost);
+    web_cors_t cors;
+    web_json_head(req, 200, &cors);
+    bool started = false, more = true;
+    esp_err_t err = ESP_OK;
+    while (more && err == ESP_OK && !h.text.failed) {
+        more = events_next(&cursor, add_json, &h);
+        if (!more) {
+            append(&h.text, "]}");
+        }
+        if ((!more || h.text.len >= HISTORY_CHUNK) && !h.text.failed) {
+            err = httpd_resp_send_chunk(req, h.text.buf, (ssize_t)h.text.len);
+            started = true;
+            h.text.len = 0;
+        }
     }
+    free(h.text.buf);
+    if (h.text.failed) {
+        /* Out of memory: a 500 if nothing has gone yet; otherwise the connection is closed, so a
+         * client never takes a reply cut short for a whole one */
+        return started ? ESP_FAIL : httpd_resp_send_500(req);
+    }
+    return err == ESP_OK ? httpd_resp_send_chunk(req, NULL, 0) : err;
 }
 
 static bool wants_stream(httpd_req_t *req)
@@ -282,14 +322,7 @@ esp_err_t web_events_get(httpd_req_t *req)
     }
 
     if (!wants_stream(req)) {
-        history_t h = { .events = cJSON_CreateArray() };
-        uint32_t lost = 0;
-        const uint16_t seq = events_since((uint16_t)after, want & ~events_states(), add_json, &h, &lost);
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddNumberToObject(o, "seq", seq);
-        cJSON_AddNumberToObject(o, "lost", lost);
-        cJSON_AddItemToObject(o, "events", h.events);
-        return web_send_json(req, 200, o);
+        return send_history(req, (uint16_t)after, want & ~events_states());
     }
 
     stream_t *s = NULL;

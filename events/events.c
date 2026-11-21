@@ -286,10 +286,10 @@ cJSON *events_state_json(events_mask_t bit)
     return o;
 }
 
-uint16_t events_since(uint16_t after, events_mask_t mask, events_each_fn_t cb, void *ctx, uint32_t *lost)
+/* With the lock held: the count of the first kept happening after `after` (a seq; 0 for all of
+ * them), and in `lost` how many after `after` are no longer kept */
+static uint32_t first_after(uint16_t after, uint32_t latest, uint32_t *lost)
 {
-    lock();
-    const uint32_t latest = s_count;
     const uint32_t oldest = latest > EVENTS_KEPT ? latest - EVENTS_KEPT + 1 : 1;
     /* `after` as a count: how far back it is from the latest, going round 65535 */
     uint32_t from = 0;
@@ -300,7 +300,14 @@ uint16_t events_since(uint16_t after, events_mask_t mask, events_each_fn_t cb, v
     if (lost != NULL) {
         *lost = oldest > from + 1 && latest >= oldest ? oldest - (from + 1) : 0;
     }
-    for (uint32_t n = from + 1 > oldest ? from + 1 : oldest; latest != 0 && n <= latest; n++) {
+    return from + 1 > oldest ? from + 1 : oldest;
+}
+
+uint16_t events_since(uint16_t after, events_mask_t mask, events_each_fn_t cb, void *ctx, uint32_t *lost)
+{
+    lock();
+    const uint32_t latest = s_count;
+    for (uint32_t n = first_after(after, latest, lost); latest != 0 && n <= latest; n++) {
         const kept_t *k = &s_ring[n % EVENTS_KEPT];
         if (k->n == n && (k->bit & mask) && cb != NULL) {
             cb(seq_of(n), k->bit, k->json, ctx);
@@ -309,6 +316,33 @@ uint16_t events_since(uint16_t after, events_mask_t mask, events_each_fn_t cb, v
     const uint16_t seq = seq_of(latest);
     unlock();
     return seq;
+}
+
+uint16_t events_open(uint16_t after, events_mask_t mask, events_cursor_t *cursor, uint32_t *lost)
+{
+    lock();
+    const uint32_t latest = s_count;
+    *cursor = (events_cursor_t){ .next = first_after(after, latest, lost), .last = latest, .mask = mask };
+    const uint16_t seq = seq_of(latest);
+    unlock();
+    return seq;
+}
+
+bool events_next(events_cursor_t *cursor, events_each_fn_t cb, void *ctx)
+{
+    bool found = false;
+    lock();
+    /* Counts, not seqs: what was published since the open doesn't move the cursor's range, and a
+     * slot taken by a newer happening meanwhile holds a later count, so it is skipped */
+    for (; !found && cursor->next <= cursor->last; cursor->next++) {
+        const kept_t *k = &s_ring[cursor->next % EVENTS_KEPT];
+        if (k->n == cursor->next && (k->bit & cursor->mask)) {
+            cb(seq_of(cursor->next), k->bit, k->json, ctx);
+            found = true;
+        }
+    }
+    unlock();
+    return found;
 }
 
 int events_listen(events_mask_t want, events_notify_fn_t fn, void *ctx)

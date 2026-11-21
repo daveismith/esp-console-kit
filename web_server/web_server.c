@@ -206,18 +206,14 @@ static bool origin_allowed(const char *origin)
     return false;
 }
 
-/* The request's Origin, when it is on the allowlist. The CORS headers point into `c`, which must
- * live until the reply is sent. */
-typedef struct {
-    char origin[128];
-} cors_t;
-
 bool web_cors_origin(httpd_req_t *req, char *out, size_t len)
 {
     return httpd_req_get_hdr_value_str(req, "Origin", out, len) == ESP_OK && origin_allowed(out);
 }
 
-static bool cors_headers(httpd_req_t *req, cors_t *c)
+/* The request's Origin, when it is on the allowlist. The CORS headers point into `c`, which must
+ * live until the reply is sent. */
+static bool cors_headers(httpd_req_t *req, web_cors_t *c)
 {
     if (httpd_req_get_hdr_value_str(req, "Origin", c->origin, sizeof(c->origin)) != ESP_OK ||
         !origin_allowed(c->origin)) {
@@ -335,6 +331,16 @@ static const char *status_line(int status)
     }
 }
 
+void web_json_head(httpd_req_t *req, int status, web_cors_t *cors)
+{
+    httpd_resp_set_status(req, status_line(status));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (cors_headers(req, cors)) {
+        httpd_resp_set_hdr(req, "Access-Control-Expose-Headers", "WWW-Authenticate");
+    }
+}
+
 esp_err_t web_send_json(httpd_req_t *req, int status, cJSON *root)
 {
     char *text = cJSON_PrintUnformatted(root);
@@ -342,13 +348,8 @@ esp_err_t web_send_json(httpd_req_t *req, int status, cJSON *root)
     if (text == NULL) {
         return httpd_resp_send_500(req);
     }
-    httpd_resp_set_status(req, status_line(status));
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    cors_t cors;
-    if (cors_headers(req, &cors)) {
-        httpd_resp_set_hdr(req, "Access-Control-Expose-Headers", "WWW-Authenticate");
-    }
+    web_cors_t cors;
+    web_json_head(req, status, &cors);
     const esp_err_t err = httpd_resp_sendstr(req, text);
     cJSON_free(text);
     return err;
@@ -550,7 +551,7 @@ static esp_err_t send_asset(httpd_req_t *req, const web_asset_t *a)
     /* The assets are part of the image: they change exactly when the image does */
     char tag[24];
     snprintf(tag, sizeof(tag), "\"%s\"", s_etag);
-    cors_t cors;
+    web_cors_t cors;
     cors_headers(req, &cors);   /* /api/v1/openapi.json, for an API tool to load */
     char seen[24];
     if (httpd_req_get_hdr_value_str(req, "If-None-Match", seen, sizeof(seen)) == ESP_OK &&
@@ -740,7 +741,7 @@ static esp_err_t dispatch(httpd_req_t *req)
 /* A CORS preflight: which methods and headers an allowed origin may use. */
 static esp_err_t preflight(httpd_req_t *req)
 {
-    cors_t cors;
+    web_cors_t cors;
     if (!cors_headers(req, &cors)) {
         return web_send_error(req, 403, "cors", "this site is not allowed to call the board (`web cors` on its console)");
     }
@@ -1033,7 +1034,7 @@ static esp_err_t api_handler(httpd_req_t *req)
     free(query);
     if (reply.body == NULL) {
         httpd_resp_set_status(req, reply.status == 204 ? "204 No Content" : "500 Internal Server Error");
-        cors_t cors;
+        web_cors_t cors;
         cors_headers(req, &cors);
         return httpd_resp_send(req, NULL, 0);
     }

@@ -77,6 +77,21 @@ cJSON *events_state_json(events_mask_t bit);
 typedef void (*events_each_fn_t)(uint16_t seq, events_mask_t bit, const char *json, void *ctx);
 uint16_t events_since(uint16_t after, events_mask_t mask, events_each_fn_t cb, void *ctx, uint32_t *lost);
 
+/*
+ * The same happenings one at a time, for a reply sent in pieces with the ring unlocked between
+ * them. events_open() returns what events_since() would (the latest seq, and `lost`) and sets
+ * `cursor` on the first; each events_next() gives `cb` the next one, with the ring locked as
+ * above, and returns false when there are no more. None published after the open is given; one
+ * kept at the open but pushed out of the ring before its turn (EVENTS_KEPT newer ones meanwhile)
+ * is skipped.
+ */
+typedef struct {
+    uint32_t next, last;        /* counts from 1, not seqs */
+    events_mask_t mask;
+} events_cursor_t;
+uint16_t events_open(uint16_t after, events_mask_t mask, events_cursor_t *cursor, uint32_t *lost);
+bool events_next(events_cursor_t *cursor, events_each_fn_t cb, void *ctx);
+
 /* ---- listeners ----
  *
  * A listener says which kinds it wants, and is told (`notify`, on whichever task changed
