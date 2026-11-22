@@ -17,6 +17,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `events` | `events_declare()`, `events_changed()`, `events_happened()`; `events_listen()` | none: what changed, for the web server's event stream and any other listener |
 | `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()`; `holo_motion()`, `holo_status()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
+| `canbus` | `register_can_commands(&cfg)` (it calls `canbus_init()`); `canbus_init()` first from `app_main` for a protocol on top that uses `canbus_start()` and the rest of `canbus.h` without the command | `can`: `start` `stop` `send` `dump` `echo` `recover` |
 
 Notes:
 
@@ -165,6 +166,21 @@ Notes:
   - `holo_motion()` and `holo_status()` are the console's verbs and status for other callers
     (an HTTP API), with the same ranges and refusals.
 
+- `canbus` runs one TWAI (CAN) controller, classic frames only, on the ESP32-S3 or the ESP32-P4:
+  frames in through a queue the ISR fills, out through a pool it empties, and the error state.
+  One owner at a time holds it through a handle (the `can` command, or a protocol such as a
+  Cyphal node); anyone may read `canbus_status()`. The application chooses the pins and guards
+  them: `can_cmd_config_t.pins` names them and says when something else holds them, `on_pins`
+  hears when `can` takes and gives them back (for a `gpio` reserved list), and `print`, if
+  given, takes `can dump`'s lines, the only output made from a task other than the console's
+  (for a firmware whose global stdout a network console can swap or close). Set
+  `CONFIG_TWAI_ISR_CACHE_SAFE`, so a frame arriving during a flash write still reaches the
+  queue; `CONFIG_CANBUS_RX_QUEUE_LEN` is the queue, sized against the longest flash stall the
+  board sees under a saturated bus. At 1 Mbit/s both targets sample at 85.0 % with 20 quanta a
+  bit (S3: 80 MHz APB, prescaler 4; P4: 40 MHz crystal, prescaler 2). `tools/can_check.py` is
+  the computer's side: a gs_usb adapter (candleLight, CANable) through python-can, to send,
+  listen, flood, or count a board's `can echo` back.
+
 ## Moving files: `tools/fs_xfer.py`
 
 The host side of `fs put`/`fs get`. It needs only pyserial; the ESP-IDF Python
@@ -254,3 +270,5 @@ To work on a component locally, temporarily replace `git`/`version` with
 - `servo` is r2_domeplayer's `components/servo` (as of `8548fce`), with GPIO servos
   attachable through the C API. `holo` is its `main/panel_holo.c`, with the dome's
   joint registry and arm switch turned into hooks.
+- `canbus` and `tools/can_check.py` are holo-player-fw's (`components/canbus`, as of
+  `82b2756`), made target-neutral for the ESP32-P4.

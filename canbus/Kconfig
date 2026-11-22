@@ -1,0 +1,59 @@
+menu "CAN (canbus)"
+
+    config CANBUS_RX_QUEUE_LEN
+        int "Frames the receive queue holds"
+        default 256
+        range 16 1024
+        help
+            Between the controller's interrupt and whoever reads the frames (the `can` command,
+            or the Cyphal node). 24 bytes each, in internal RAM, from the first start on.
+
+            A flash write holds the reader off while the interrupt goes on filling the queue:
+            an erase runs for up to CONFIG_SPI_FLASH_ERASE_YIELD_DURATION_MS (20 ms) before it
+            yields. Measured 2026-11-20 with a bus saturated at 1 Mbit/s by 8-byte frames
+            (about 8,100 a second) during a 1 MB LittleFS write (`fs bench 1024`): the queue
+            held 155 and 164 frames at most in two runs, and a 128-frame queue dropped 997 frames
+            over the write (holo-player-fw's ESP32-S3). On the dome panel's ESP32-P4 (2026-11-21),
+            a bus saturated by the adapter at ~8,800 frames a second across 100 console commands,
+            each seven 4 KB erases, held 20 at most and dropped none. 256 covers both with room.
+            A bus saturated with shorter frames (up to about 21,000 a second with no data) would
+            need more; a Cyphal bus is normally far lighter.
+
+    config CANBUS_TX_QUEUE_LEN
+        int "Frames waiting to be sent"
+        default 16
+        range 2 255
+        help
+            Frames given to canbus_send() and not yet on the bus. When they are all waiting
+            (nobody acknowledging, or bus-off), canbus_send() waits for room or times out. The `can`
+            command uses them all; the Cyphal node one (canbus_config_t.tx_slots), keeping its
+            own queue in priority order in front.
+
+    config CANBUS_CMD_TASK_STACK
+        int "`can` reader task: stack (bytes)"
+        default 3072
+        range 2048 16384
+        help
+            The task `can start` makes to read the receive queue, echo and print. Internal RAM,
+            from `can start` to `can stop` only. 3072 is what it has run on since it was written.
+            Measured on the ESP32-P4 (2026-11-22, `tasks` after 17,000 frames echoed with `can
+            dump` printing 3,000 of them): 2268 bytes left at the low-water mark, so ~800 used.
+
+    config CANBUS_CMD_TASK_PRIO
+        int "`can` reader task: priority"
+        default 6
+        range 1 24
+        help
+            Above the console's, so an echo is not held behind a command the console is
+            printing. The default is the first application's (holo-player-fw), where it sits
+            over that board's video player at 5.
+
+    config CANBUS_CMD_TASK_CORE
+        int "`can` reader task: core"
+        default 0
+        range 0 1
+        help
+            Core 0 is the console's on both targets; the first application (holo-player-fw)
+            keeps core 1 for its video player.
+
+endmenu
