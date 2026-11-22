@@ -1,0 +1,149 @@
+menu "Cyphal node (cyphal)"
+
+    config CYPHAL_DEFAULT_NAME
+        string "The node's name in uavcan.node.GetInfo, until `cyphal name` changes it"
+        default "node"
+        help
+            1 to 50 characters of a-z, 0-9, _ and ., with no empty part and no part starting with
+            a digit (cyphal_name_valid(), cyphal_util.h). Checked at start: a default that breaks
+            the rules is replaced by "node", with a warning. A firmware sets its own in its
+            sdkconfig.defaults.
+
+    config CYPHAL_NAME_REGISTER
+        string "The register that holds the node's name"
+        default "node.name"
+        help
+            The name uavcan.register.Access reads and writes the node's name by (the setting
+            `cyphal name` changes): a register name by the standard's rules, a-z, 0-9, _ and .,
+            with at least one dot. Not uavcan.node.description, which is a free-text note that
+            doesn't change what GetInfo reports. A firmware sets its own in its
+            sdkconfig.defaults.
+
+    config CYPHAL_UNIQUE_ID_PREFIX
+        string "The unique ID's first 8 bytes: the firmware's name"
+        default "esp-node"
+        help
+            Exactly 8 characters. The unique ID is these 8 bytes, two zero bytes and the chip's
+            base MAC address (cyphal_unique_id(), cyphal_util.h). An allocator gives a node-ID
+            by unique ID, so changing this gives every board a new node-ID: a firmware pins its
+            own in its sdkconfig.defaults.
+
+    config CYPHAL_HARDWARE_VERSION_MAJOR
+        int "The hardware version GetInfo reports: major"
+        default 0
+        range 0 255
+
+    config CYPHAL_HARDWARE_VERSION_MINOR
+        int "The hardware version GetInfo reports: minor"
+        default 0
+        range 0 255
+
+    config CYPHAL_HEAP_SIZE
+        int "libcanard's heap (bytes, in PSRAM)"
+        default 32768
+        range 8192 131072
+        help
+            A heap of its own for libcanard, reserved at the node's first start and kept, in PSRAM
+            when there is any. Each start begins it empty. It holds the transmit queue (at most
+            160 frames, 84 bytes each with the allocator's overhead: 13.4 KB; a port list is 22
+            frames), the receive sessions (36 bytes for each node and service that has sent the
+            node a request: 4.6 KB for 127 nodes on one service; and, while it waits for a
+            node-ID, one for each allocator that answers) and each transfer as it is reassembled,
+            at its type's extent (a register request, 515 bytes). Measured on holo-player-fw
+            (ESP32-S3) 2026-11-20 with the
+            register and command services and the port list: 1,932 bytes at most (a port list
+            waiting to go), through 500 GetInfo calls back to back and the whole hardware suite;
+            2,016 alone on the bus for 10 minutes, where every transfer waits out its second. With
+            the holo's ports (a Status of 13 frames once a second or four, Axes, setpoints at 50 a
+            second, Motion and Light), the same day: 2,124 at most over 10 minutes of motions,
+            setpoint bursts and lights during a clip, 2,088 over the holo's tests, and 4,460 alone on
+            the bus for 10 minutes, where each Status waits out its second too.
+            `cyphal` shows how much it has held at most.
+
+    config CYPHAL_TASK_PRIORITY
+        int "The node task's priority"
+        default 5
+        range 1 24
+        help
+            The task reads the controller's receive queue (CONFIG_CANBUS_RX_QUEUE_LEN frames) and
+            keeps the heartbeat on time, so it should not wait behind a task that keeps a core
+            busy (holo-player-fw's video player, a display's render task).
+
+    config CYPHAL_TASK_CORE
+        int "The core the node task runs on"
+        default 0
+        range 0 1
+
+    config CYPHAL_TASK_STACK
+        int "The node task's stack (bytes)"
+        default 3072
+        help
+            In internal RAM, while the node runs. Measured on holo-player-fw (ESP32-S3)
+            2026-11-20 with `cyphal`'s report of the
+            stack never used, over 500 GetInfo calls back to back, a clip, an update written over
+            Wi-Fi, board restarts and every kind of collision stop (the listen, running, and in the
+            middle of a response): 1,312 bytes used in most runs, 1,636 at most (924 never used),
+            after a log line (going online, or the collision warning). With plug-and-play, the
+            same day: 1,756 at most (804 never used), just after an allocation, whose log line is
+            written from inside the transmit path; the same after a 15-minute soak with a clip, the
+            LED ring and the web app. Log lines are the deepest calls; the spread is
+            interrupts' register spills. The register and command services deserialize and
+            serialize on it too (their structs are in PSRAM, not on it), hence 3,072: measured
+            2026-11-20 over the whole hardware suite, 1,552 bytes used at most (1,520 never used),
+            in the test of a collision in the middle of a response. The holo's requests are decoded
+            and its setpoints copied here too: 1,356 used at most (1,716 never used) over the holo's
+            tests and 10 minutes of them during a clip.
+
+    config CYPHAL_WORKER_STACK
+        int "The node's worker task's stack (bytes)"
+        default 4608
+        help
+            In internal RAM, from the node's first start on. The worker does what the node's task
+            may not wait for: a register written to NVS, a restart, a factory reset (NVS), and
+            identify, unless the application says identify can take long (cyphal_app_t.identify_slow,
+            as holo-player-fw does), and the application's requests and poll. On holo-player-fw
+            (ESP32-S3) it also runs the holo's Motion (the HTTP API's motion code), Light and
+            Ring, carries out its setpoints, and builds its Status, Event (a happening's JSON parsed)
+            and Axes, reading the screen without waiting for it (the application's poll). Work that
+            can take long (an image shown, which decodes it; a scene applied; identify) goes to the
+            second worker instead (CONFIG_CYPHAL_SLOW_STACK). Measured 2026-11-21 on 6,144 bytes over
+            the holo's, the scenes', screen and ring, register and command tests and 5 minutes of the
+            holo's load test: 2,088 bytes used at most (2,012 by a factory reset's NVS writes, logged
+            before the restart). 4,608 leaves 2.5 KB of that unused.
+            (Earlier, with identify on the worker: 2,844; while Motion built the route's JSON: 3,052.)
+
+    config CYPHAL_WORKER_PRIORITY
+        int "The node's worker task's priority"
+        default 5
+        range 1 24
+        help
+            Below the node's task (CONFIG_CYPHAL_TASK_PRIORITY), which must never wait for it
+            (holo-player-fw's host link task, which runs the same kind of work, is at 5).
+
+    config CYPHAL_SLOW_STACK
+        int "The node's second worker's stack (bytes)"
+        default 7680
+        help
+            In internal RAM, from the node's first start on, and only when the application has work
+            that can take long (cyphal_handler_t.slow, cyphal_app_t.identify_slow): on
+            holo-player-fw r2.holo.Scene and Screen, which show a file (an image is decoded on the task that shows
+            it), and identify, which applies a scene. It can't be in PSRAM there, as the kit's servo
+            task's can (SERVO_TASK_STACK_IN_PSRAM): that task reads LittleFS (the file shown) and NVS (the
+            scene), and a flash access turns the cache off, which leaves PSRAM unreachable here (no
+            XIP from PSRAM: CONFIG_SPIRAM_XIP_FROM_PSRAM and CONFIG_SPIRAM_FETCH_INSTRUCTIONS are off),
+            a stack in it included; servo never touches flash. Measured 2026-11-21 on 8,192 bytes over
+            the Scene, Screen and event tests and every still on the board through Screen (PNGs of
+            each kind, an interlaced and a worst-case PNG, JPEGs, clips, GIFs, refusals, scenes that
+            show them, identify): 5,708 bytes used at most, by a palette PNG; 7,680 leaves 1.9 KB of
+            that unused. The host link's task (CONFIG_HOSTLINK_TASK_STACK) and the web server's run
+            the same routes on 10 KB; the host link's doesn't run while its pins are the node's.
+
+    config CYPHAL_SLOW_PRIORITY
+        int "The node's second worker's priority"
+        default 4
+        range 1 24
+        help
+            Below the worker (CONFIG_CYPHAL_WORKER_PRIORITY): slow work here (an image decoding, on
+            holo-player-fw) doesn't keep the worker's setpoints and published messages waiting.
+
+endmenu

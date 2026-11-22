@@ -18,6 +18,8 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `servo` | `servo_attach_pca9685()` / `servo_attach_gpio()`, then `register_servo(attach_fn)` | `servo_list` `servo_register` `servo_move` `servo_sweep` `servo_config` `servo_off` |
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()`; `holo_motion()`, `holo_status()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 | `canbus` | `register_can_commands(&cfg)` (it calls `canbus_init()`); `canbus_init()` first from `app_main` for a protocol on top that uses `canbus_start()` and the rest of `canbus.h` without the command | `can`: `start` `stop` `send` `dump` `echo` `recover` |
+| `libcanard` | nothing: `cyphal` requires it | none: OpenCyphal's libcanard v4.0.0 (`third_party/libcanard`) packaged as a component |
+| `cyphal` | `cyphal_init(&app)`, `cyphal_register_commands(how_to_start)`, then `cyphal_start(tx, rx)` | `cyphal`: `id` `name` `bitrate` `restart` `reset` `register` |
 
 Notes:
 
@@ -181,6 +183,41 @@ Notes:
   the computer's side: a gs_usb adapter (candleLight, CANable) through python-can, to send,
   listen, flood, or count a board's `can echo` back.
 
+- `cyphal` is a Cyphal/CAN node on `canbus`, on libcanard v4.0.0 (`third_party/libcanard`; v5
+  cannot send the anonymous plug-and-play request). It takes a node-ID, fixed or by
+  plug-and-play (`uavcan.pnp.NodeIDAllocationData.1.0`, asked for again at every start), sends
+  `uavcan.node.Heartbeat` every second and `uavcan.node.port.List` every 10 s, answers
+  `uavcan.node.GetInfo`, `uavcan.register.List` and `Access`, and `uavcan.node.ExecuteCommand`,
+  and stops, sending nothing more as that ID, when another node turns out to have its node-ID
+  (in the listen before going online, or while online).
+  - Who the board is comes from Kconfig, pinned in the firmware's `sdkconfig.defaults`: the
+    name GetInfo reports (`CONFIG_CYPHAL_DEFAULT_NAME`), the register that holds it
+    (`CONFIG_CYPHAL_NAME_REGISTER`), the hardware version, and the unique ID's 8-byte prefix
+    (`CONFIG_CYPHAL_UNIQUE_ID_PREFIX`). The unique ID is that prefix, two zero bytes and the
+    chip's base MAC, so changing the prefix gives every board a new node-ID from an allocator.
+  - What a restart, a factory reset and identify do, and any ports and registers of the
+    application's own, are `cyphal_app_t`. A NULL `restart` makes restart and factory reset bad
+    commands; a NULL `identify` makes identify one; a NULL `factory_reset` resets the node's
+    own settings only.
+  - Its settings (node-ID, name, bitrate, each application port's ID) are registers, saved in
+    NVS namespace `cyphal` and applied from the node's next start. None is a credential or a
+    counter, so a configuration backup keeps them.
+  - It has no stop: the application decides whether and on which pins it starts. While it runs
+    it is `canbus`'s owner, and `can` only reports.
+  - One task runs libcanard (`CONFIG_CYPHAL_TASK_*`, internal stack); a worker (internal stack,
+    made at the first start) does what may wait: NVS writes, the restart, the application's
+    requests; a second worker only when the application has slow work. libcanard's heap
+    (`CONFIG_CYPHAL_HEAP_SIZE`) and the node's state are PSRAM when there is any. Set
+    `CONFIG_TWAI_ISR_CACHE_SAFE`, as for `canbus`.
+  - `dsdl/` holds the generated C headers of the standard `uavcan` types it and its users need,
+    committed so a build needs no Python; `tools/gen_dsdl.py` regenerates them from
+    `third_party/public_regulated_data_types` with nunavut 2.3.1 (`--check` compares and changes
+    nothing). An application's own types are generated in its own tree.
+  - Host tests: `make -C tests/host` builds `cyphal_util.c` and `cyphal_registers.c` with the
+    computer's `cc` and runs them (no ESP-IDF).
+  - Clone recursively: libcanard and the DSDL are submodules under `third_party/`, which IDF
+    does not take for components (it has no `CMakeLists.txt`).
+
 ## Moving files: `tools/fs_xfer.py`
 
 The host side of `fs put`/`fs get`. It needs only pyserial; the ESP-IDF Python
@@ -240,7 +277,7 @@ list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/external/esp-console
 
 Then add the components you use to `main`'s `REQUIRES` / `PRIV_REQUIRES`. That's
 required under `MINIMAL_BUILD`, and good practice otherwise. Clone the project with
-`git clone --recursive`, or run `git submodule update --init` after cloning.
+`git clone --recursive`, or run `git submodule update --init --recursive` after cloning (the kit has submodules of its own, under `third_party/`).
 
 Don't put the submodule directly under `components/`. IDF only looks one level
 deep there, so it would miss the components nested inside.

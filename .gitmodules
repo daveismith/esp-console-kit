@@ -1,0 +1,6 @@
+[submodule "third_party/libcanard"]
+	path = third_party/libcanard
+	url = https://github.com/OpenCyphal/libcanard.git
+[submodule "third_party/public_regulated_data_types"]
+	path = third_party/public_regulated_data_types
+	url = https://github.com/OpenCyphal/public_regulated_data_types.git
