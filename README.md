@@ -19,7 +19,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()`; `holo_motion()`, `holo_status()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 | `canbus` | `register_can_commands(&cfg)` (it calls `canbus_init()`); `canbus_init()` first from `app_main` for a protocol on top that uses `canbus_start()` and the rest of `canbus.h` without the command | `can`: `start` `stop` `send` `dump` `echo` `recover` |
 | `libcanard` | nothing: `cyphal` requires it | none: OpenCyphal's libcanard v4.0.0 (`third_party/libcanard`) packaged as a component |
-| `cyphal` | `cyphal_init(&app)`, `cyphal_register_commands(how_to_start)`, then `cyphal_start(tx, rx)` | `cyphal`: `id` `name` `bitrate` `restart` `reset` `register` |
+| `cyphal` | `cyphal_init(&app)`, `cyphal_register_commands(how_to_start)`, then `cyphal_start(tx, rx)` | `cyphal`: `id` `name` `bitrate` `restart` `reset` `register` (and `allocator` `allocations` with `CONFIG_CYPHAL_PNP_ALLOCATOR`) |
 
 Notes:
 
@@ -213,8 +213,50 @@ Notes:
     committed so a build needs no Python; `tools/gen_dsdl.py` regenerates them from
     `third_party/public_regulated_data_types` with nunavut 2.3.1 (`--check` compares and changes
     nothing). An application's own types are generated in its own tree.
-  - Host tests: `make -C tests/host` builds `cyphal_util.c` and `cyphal_registers.c` with the
-    computer's `cc` and runs them (no ESP-IDF).
+  - **A plug-and-play allocator, optionally** (`CONFIG_CYPHAL_PNP_ALLOCATOR`, off by default;
+    `cyphal_alloc.h`). With the option built in and the run-time setting on (`cyphal allocator
+    on`, or the bit register `CONFIG_CYPHAL_ALLOCATOR_REGISTER`; saved, off until set, applied at
+    the node's next start), the node answers `uavcan.pnp.NodeIDAllocationData.1.0` requests,
+    giving node-IDs from `CONFIG_CYPHAL_ALLOCATOR_FIRST`..`_LAST` (100 to 119) and remembering
+    them in a table of `CONFIG_CYPHAL_ALLOCATOR_TABLE` rows (16), saved in NVS (`cyphal`
+    namespace, keys `pnp_alloc` and `pnp_table`), so a node that asks again gets its node-ID
+    back, across restarts. The rules, from the type's own text and the plan that built it:
+    - It allocates only with a fixed node-ID. With plug-and-play it asks for one as before and
+      gives none; `cyphal` says why.
+    - It is quiet through the fixed node-ID's 2 s listen, then answers each request at once
+      (nominal priority; the spec names none), from its own node-ID, with the request's
+      pseudo-ID and the row's node-ID: 9 bytes, two frames.
+    - One allocator a bus: the first frame of another node's answer on subject 8166, heard at
+      any time from the start, stops it until the node's next start, with one warning and the
+      other's node-ID in `cyphal`. Plug-and-play v1 has no arbitration between allocators.
+    - It never gives its own node-ID, or one heard on the bus within a heartbeat's offline
+      timeout (3 s). A node heard with a node-ID in the range and no row gets a row of its own,
+      marked heard and never given (the spec's mock entry).
+    - A full table, or a range with nothing free, gets no answer (the spec's rule), counted and
+      logged once a start. A row is saved by the worker when it is added, never once per
+      request.
+    - `cyphal allocations` lists the table; `forget <id>` and `clear` edit it (the spec's table
+      only grows; these are the operator's way out). `cyphal reset` and a factory reset over
+      Cyphal turn the setting off and empty the table.
+    - Keyed by pseudo-ID alone: the node makes no client calls, so no `GetInfo` follow-up.
+    - What it costs, on the dome panel's ESP32-P4 (2026-11-22): 8.8 KB of code, 200 bytes of
+      static internal RAM, the table in PSRAM; through 200 requests a second for a minute, no
+      NVS write, heartbeats 0.99-1.01 s apart, libcanard's heap 2,100 bytes at most.
+    - Without the option nothing of it is compiled: `cyphal_alloc.c` is left out of the
+      component, and the calls into it from `cyphal.c` and `cmd_cyphal.c` are under `#if`, so
+      the objects' code and data are what they were, but for one value: `ESP_ERROR_CHECK`'s
+      `__LINE__` in `cyphal_register_commands()`, which the lines added above it move (checked
+      on the dome panel's build by an `objdump -d` diff; the debug line tables move too).
+    - A reset (`cyphal reset`, a factory reset) also stops the allocator for the rest of the
+      run, so no row is added after it. A row whose node-ID is the allocator's own is not
+      answered (`cyphal allocations forget` it). An answer is not queued while the transmit
+      queue is nearly full (128 of 160 frames), so a request storm can't starve the heartbeat.
+      A node-ID answered in the last 2 s counts as taken even if its row was just forgotten
+      (the allocatee holds it about 1 s before it is heard). A `clear` while nodes in the
+      range are online makes each a heard row at its next heartbeat. The port list names
+      subject 8166 while the allocator answers.
+  - Host tests: `make -C tests/host` builds `cyphal_util.c`, `cyphal_registers.c` and
+    `cyphal_alloc.c` with the computer's `cc` and runs them (no ESP-IDF).
   - Clone recursively: libcanard and the DSDL are submodules under `third_party/`, which IDF
     does not take for components (it has no `CMakeLists.txt`).
 

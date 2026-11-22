@@ -9,6 +9,16 @@
 #include "esp_console.h"
 #include "esp_heap_caps.h"
 #include "sdkconfig.h"
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+#include "cyphal_alloc.h"
+#define ALLOC_HINT " | allocator [on|off] | allocations [forget <id>|clear]"
+#define ALLOC_HELP " `allocator` shows the plug-and-play allocator; `on` or `off` sets it, from the node's next start " \
+                   "(it allocates only with a fixed node-ID). `allocations` lists the node-IDs it has given; " \
+                   "`forget <id>` frees one, `clear` all."
+#else
+#define ALLOC_HINT ""
+#define ALLOC_HELP ""
+#endif
 
 static const char *s_how_to_start;     /* the application's words for what turns the node on */
 
@@ -66,6 +76,50 @@ static void print_register(size_t index, const cyphal_status_t *st)
     }
     printf("\n");
 }
+
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+/* The plug-and-play allocator's lines: in `cyphal` only when it is on (saved or running) or its table has rows, so that
+ * a node that has never allocated reports as it always did; with `always` (`cyphal allocator`), every time */
+static void print_allocator(bool always)
+{
+    cyphal_allocator_status_t a;
+    cyphal_allocator_status(&a);
+    if (!always && !a.saved && !a.running && a.rows == 0) {
+        return;
+    }
+    printf("  allocator: %s, node-IDs %u to %u", a.running ? "on" : "off", a.first, a.last);
+    switch (a.state) {
+    case CYPHAL_ALLOCATOR_NEEDS_FIXED:
+        printf("; allocating nothing: the node-ID is plug-and-play, and an allocator needs a fixed one");
+        break;
+    case CYPHAL_ALLOCATOR_LISTENING:
+        printf("; quiet while the node listens");
+        break;
+    case CYPHAL_ALLOCATOR_ACTIVE:
+        printf("; answering requests");
+        break;
+    case CYPHAL_ALLOCATOR_YIELDED:
+        printf("; stopped: node %u answers requests too (one allocator a bus), until the node's next start", a.other);
+        break;
+    case CYPHAL_ALLOCATOR_STOPPED:
+        printf("; stopped with the node");
+        break;
+    case CYPHAL_ALLOCATOR_RESET:
+        printf("; stopped by a reset, until the node's next start");
+        break;
+    default:
+        break;
+    }
+    printf("\n    table %u of %u rows (%u heard on the bus)%s; requests %lu, allocations %lu, repeats %lu, "
+           "refused for no room %lu, yielded %lu, own node-ID %lu, shed %lu\n", (unsigned)a.rows, (unsigned)a.capacity,
+           (unsigned)a.heard_rows, a.unsaved ? ", a row not saved yet" : "", (unsigned long)a.requests,
+           (unsigned long)a.allocations, (unsigned long)a.repeats, (unsigned long)a.refused, (unsigned long)a.yielded,
+           (unsigned long)a.own, (unsigned long)a.shed);
+    if (a.saved != a.running) {
+        printf("    %s from the node's next start (`cyphal restart`)\n", a.saved ? "on" : "off");
+    }
+}
+#endif
 
 static void print_status(void)
 {
@@ -158,6 +212,9 @@ static void print_status(void)
         print_settings("  from the next start (`cyphal restart`): ", &st.saved);
         print_ports_changed(&st.saved, &st.running);
     }
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+    print_allocator(false);
+#endif
 }
 
 static int saved(esp_err_t err, const char *what)
@@ -204,7 +261,14 @@ static int cmd_register(int argc, char **argv)
     }
     cyphal_reg_format(&v, text, sizeof(text));
     snprintf(what, sizeof(what), "%s = %s", argv[2], text);
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+    /* The application's: in effect already. The allocator's register is kept as one of them but applies at the node's
+     * next start, as the node's settings do */
+    if (!(cyphal_reg((size_t)index)->flags & CYPHAL_REG_NEXT_START) &&
+        strcmp(cyphal_reg((size_t)index)->name, CONFIG_CYPHAL_ALLOCATOR_REGISTER) != 0) {
+#else
     if (!(cyphal_reg((size_t)index)->flags & CYPHAL_REG_NEXT_START)) {      /* the application's: in effect already */
+#endif
         printf("cyphal: %s%s%s\n", what, err == ESP_OK ? "" : ": ", err == ESP_OK ? "" : esp_err_to_name(err));
         return err == ESP_OK ? 0 : 1;
     }
@@ -222,6 +286,70 @@ static bool parse_node_id(const char *s, uint8_t *out)
     *out = (uint8_t)v;
     return true;
 }
+
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+/* `cyphal allocator [on|off]` */
+static int cmd_allocator(int argc, char **argv)
+{
+    if (argc == 2) {
+        print_allocator(true);
+        return 0;
+    }
+    if (argc == 3 && (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "off") == 0)) {
+        const bool on = strcmp(argv[2], "on") == 0;
+        return saved(cyphal_set_allocator(on), on ? "the allocator on (it allocates with a fixed node-ID only)"
+                                                  : "the allocator off");
+    }
+    printf("usage: cyphal allocator [on|off]\n");
+    return 1;
+}
+
+/* `cyphal allocations [forget <id> | clear]` */
+static int cmd_allocations(int argc, char **argv)
+{
+    if (argc == 2) {
+        /* One snapshot of the table, so that the listing is one moment's; PSRAM where there is some */
+        cyphal_alloc_row_t *rows = calloc(CONFIG_CYPHAL_ALLOCATOR_TABLE, sizeof(*rows));
+        if (rows == NULL) {
+            printf("cyphal: no memory for the listing\n");
+            return 1;
+        }
+        const size_t n = cyphal_allocator_rows(rows, CONFIG_CYPHAL_ALLOCATOR_TABLE);
+        printf("cyphal: allocations, %u of %d rows\n", (unsigned)n, CONFIG_CYPHAL_ALLOCATOR_TABLE);
+        for (size_t i = 0; i < n; i++) {
+            if (rows[i].flags & CYPHAL_ALLOC_ROW_HEARD) {
+                printf("  node %3u  heard on the bus, never given\n", rows[i].node_id);
+            } else {
+                printf("  node %3u  pseudo-ID %012llx\n", rows[i].node_id, (unsigned long long)rows[i].pseudo_id);
+            }
+        }
+        free(rows);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[2], "clear") == 0) {
+        const esp_err_t err = cyphal_allocator_clear();
+        printf("cyphal: %s\n", err == ESP_OK ? "every row forgotten, saved" : esp_err_to_name(err));
+        return err == ESP_OK ? 0 : 1;
+    }
+    uint8_t id = 0;
+    if (argc != 4 || strcmp(argv[2], "forget") != 0) {
+        printf("usage: cyphal allocations [forget <id>|clear]\n");
+        return 1;
+    }
+    if (!parse_node_id(argv[3], &id)) {
+        printf("cyphal: a node-ID is 0 to 127\n");
+        return 1;
+    }
+    const esp_err_t err = cyphal_allocator_forget(id);
+    if (err == ESP_ERR_NOT_FOUND) {
+        printf("cyphal: no row has node %u\n", id);
+    } else {
+        printf("cyphal: node %u forgotten%s%s\n", id, err == ESP_OK ? ", saved" : "; not saved: ",
+               err == ESP_OK ? "" : esp_err_to_name(err));
+    }
+    return err == ESP_OK ? 0 : 1;
+}
+#endif
 
 static int cmd_cyphal(int argc, char **argv)
 {
@@ -286,8 +414,16 @@ static int cmd_cyphal(int argc, char **argv)
     if (strcmp(sub, "register") == 0) {
         return cmd_register(argc, argv);
     }
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+    if (strcmp(sub, "allocator") == 0) {
+        return cmd_allocator(argc, argv);
+    }
+    if (strcmp(sub, "allocations") == 0) {
+        return cmd_allocations(argc, argv);
+    }
+#endif
     printf("usage: cyphal [id <0-127>|auto | name <name>|--reset | bitrate <125k|250k|500k|1m> | restart | reset | "
-           "register [<name> [<value>...]]]\n");
+           "register [<name> [<value>...]]" ALLOC_HINT "]\n");
     return 1;
 }
 
@@ -303,9 +439,9 @@ void cyphal_register_commands(const char *how_to_start)
                 "`reset` puts the settings back to the defaults. `register` lists the node's Cyphal registers, which are "
                 "the same settings, the ports' IDs and the application's own; with a name, reads one; with a value "
                 "too, writes it, saved: the node's settings and the ports' IDs from the node's next start, the "
-                "application's (the holo's calibration, drive policy and touch reporting) at once.",
+                "application's (the holo's calibration, drive policy and touch reporting) at once." ALLOC_HELP,
         .hint = "[id <0-127>|auto | name <name>|--reset | bitrate <125k|250k|500k|1m> | restart | reset | "
-                "register [<name> [<value>...]]]",
+                "register [<name> [<value>...]]" ALLOC_HINT "]",
         .func = cmd_cyphal,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));

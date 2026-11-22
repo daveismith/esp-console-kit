@@ -146,4 +146,59 @@ menu "Cyphal node (cyphal)"
             Below the worker (CONFIG_CYPHAL_WORKER_PRIORITY): slow work here (an image decoding, on
             holo-player-fw) doesn't keep the worker's setpoints and published messages waiting.
 
+    config CYPHAL_PNP_ALLOCATOR
+        bool "The node can be a plug-and-play allocator"
+        default n
+        help
+            Builds in the allocator's side of uavcan.pnp.NodeIDAllocationData.1.0: with the run-time
+            setting on (`cyphal allocator on`, or the register CONFIG_CYPHAL_ALLOCATOR_REGISTER; off
+            until set, saved, applied at the node's next start) and a fixed node-ID, the node gives
+            node-IDs from CONFIG_CYPHAL_ALLOCATOR_FIRST..LAST to nodes that ask, remembers them in a
+            saved table, and stops answering until its next start if it hears another allocator
+            answer. With plug-and-play it never allocates (an allocator needs a fixed node-ID).
+            The kit's README ("cyphal") has the rules. Off, nothing of it is compiled: no setting,
+            register, console word or code. Costs, on (measured on the dome panel's ESP32-P4,
+            2026-11-22): 8.8 KB of code in flash, 200 bytes of static internal RAM, the table in
+            PSRAM (8 bytes a row, and as much again for its saved form), a subscription in
+            libcanard's heap while it answers, and two frames on the bus per request answered.
+
+    config CYPHAL_ALLOCATOR_FIRST
+        int "The first node-ID the allocator gives"
+        depends on CYPHAL_PNP_ALLOCATOR
+        default 100
+        range 1 127
+        help
+            The lowest node-ID given. Never the node's own, and never one heard on the bus within
+            a heartbeat's offline timeout (3 s); a node heard with a node-ID in the range gets a row
+            of its own, so that its ID is never given (the spec's mock entry). Keep the range clear
+            of the fixed node-IDs on the bus and of any other allocator's range.
+
+    config CYPHAL_ALLOCATOR_LAST
+        int "The last node-ID the allocator gives"
+        depends on CYPHAL_PNP_ALLOCATOR
+        default 119
+        range 1 127
+        help
+            The highest node-ID given; at least CONFIG_CYPHAL_ALLOCATOR_FIRST (the build stops
+            otherwise). 126 and 127 are the standard's for maintenance tools: best left out.
+
+    config CYPHAL_ALLOCATOR_TABLE
+        int "Rows in the allocator's table"
+        depends on CYPHAL_PNP_ALLOCATOR
+        default 16
+        range 1 64
+        help
+            How many nodes it remembers (rows given and rows heard). 8 bytes a row in PSRAM, and as
+            much again for the saved form's buffer; the NVS blob is 2 bytes and 8 a row. A full
+            table answers nothing new; the rows it has still answer.
+
+    config CYPHAL_ALLOCATOR_REGISTER
+        string "The register that holds the allocator's setting"
+        depends on CYPHAL_PNP_ALLOCATOR
+        default "pnp.allocator"
+        help
+            A bit register (mutable, persistent, applied at the node's next start) for the setting
+            `cyphal allocator` changes. A register name by the standard's rules: a-z, 0-9, _ and .,
+            with at least one dot. A firmware sets its own in its sdkconfig.defaults.
+
 endmenu
