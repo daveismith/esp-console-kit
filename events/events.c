@@ -3,8 +3,9 @@
  *
  * One mutex covers the kinds, the listeners and the ring. Nothing that might block or take
  * another component's lock -- a builder, a listener's notify -- runs while it is held, but
- * events_since()'s callback, which only copies. It is recursive, so that callback may still
- * ask for a kind's name.
+ * events_since()'s and events_next()'s callback, which only copies, and the printing of a
+ * happening's text (a hundred bytes or so), so that it is counted and kept at once. It is
+ * recursive, so that callback may still ask for a kind's name.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -216,19 +217,18 @@ void events_changed(const char *name)
 
 void events_happened(const char *name, cJSON *fields)
 {
-    lock();
-    const int i = find(name);
-    const uint32_t n = i >= 0 ? ++s_count : 0;
-    unlock();
-    if (i < 0) {
+    const events_mask_t bit = events_bit(name);
+    if (bit == 0) {
         cJSON_Delete(fields);
         return;
     }
-    const events_mask_t bit = (events_mask_t)1 << i;
 
+    /* Built outside the lock but for its seq, which is set, printed and stored in the same hold
+     * as the count is taken: s_count never counts a happening that isn't in the ring yet, so a
+     * reader that goes on from the seq it was given can't step over one still being printed */
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "event", name);
-    cJSON_AddNumberToObject(o, "seq", seq_of(n));
+    cJSON *seq = cJSON_AddNumberToObject(o, "seq", 0);
     cJSON_AddNumberToObject(o, "t_ms", (double)(esp_timer_get_time() / 1000));
     if (fields != NULL) {
         cJSON *f = fields->child;
@@ -239,22 +239,19 @@ void events_happened(const char *name, cJSON *fields)
         }
         cJSON_Delete(fields);
     }
-    char *json = cJSON_PrintUnformatted(o);
-    cJSON_Delete(o);
 
-    char *old = NULL;
     lock();
+    const uint32_t n = ++s_count;
+    cJSON_SetNumberValue(seq, seq_of(n));
+    char *json = cJSON_PrintUnformatted(o);
     kept_t *k = &s_ring[n % EVENTS_KEPT];
-    if (k->n < n) {             /* a later one may already have taken the slot */
-        old = k->json;
-        k->n = json != NULL ? n : 0;
-        k->bit = bit;
-        k->json = json;
-        json = NULL;
-    }
+    char *old = k->json;
+    k->n = json != NULL ? n : 0;    /* not printed: counted, never kept, not `lost` */
+    k->bit = bit;
+    k->json = json;
     unlock();
+    cJSON_Delete(o);
     free(old);
-    free(json);
     notify(bit, false);
 }
 
@@ -322,7 +319,7 @@ uint16_t events_open(uint16_t after, events_mask_t mask, events_cursor_t *cursor
 {
     lock();
     const uint32_t latest = s_count;
-    *cursor = (events_cursor_t){ .next = first_after(after, latest, lost), .last = latest, .mask = mask };
+    *cursor = (events_cursor_t){ .next = first_after(after, latest, lost), .last = latest, .mask = mask, .lost = 0 };
     const uint16_t seq = seq_of(latest);
     unlock();
     return seq;
@@ -332,12 +329,18 @@ bool events_next(events_cursor_t *cursor, events_each_fn_t cb, void *ctx)
 {
     bool found = false;
     lock();
-    /* Counts, not seqs: what was published since the open doesn't move the cursor's range, and a
-     * slot taken by a newer happening meanwhile holds a later count, so it is skipped */
+    /* Counts, not seqs: what was published since the open doesn't move the cursor's range. A slot
+     * taken by a newer happening meanwhile holds a later count: the one due there was pushed out,
+     * whatever its kind, and is counted. An empty slot is one never kept (not printed), skipped
+     * as events_since() skips it. */
     for (; !found && cursor->next <= cursor->last; cursor->next++) {
         const kept_t *k = &s_ring[cursor->next % EVENTS_KEPT];
-        if (k->n == cursor->next && (k->bit & cursor->mask)) {
-            cb(seq_of(cursor->next), k->bit, k->json, ctx);
+        if (k->n > cursor->next) {
+            cursor->lost++;
+        } else if (k->n == cursor->next && (k->bit & cursor->mask)) {
+            if (cb != NULL) {
+                cb(seq_of(cursor->next), k->bit, k->json, ctx);
+            }
             found = true;
         }
     }

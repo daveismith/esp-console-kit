@@ -80,14 +80,17 @@ uint16_t events_since(uint16_t after, events_mask_t mask, events_each_fn_t cb, v
 /*
  * The same happenings one at a time, for a reply sent in pieces with the ring unlocked between
  * them. events_open() returns what events_since() would (the latest seq, and `lost`) and sets
- * `cursor` on the first; each events_next() gives `cb` the next one, with the ring locked as
- * above, and returns false when there are no more. None published after the open is given; one
- * kept at the open but pushed out of the ring before its turn (EVENTS_KEPT newer ones meanwhile)
- * is skipped.
+ * `cursor` on the first; each events_next() gives `cb` (NULL: none) the next one, with the ring
+ * locked as above, and returns false when there are no more. None published after the open is
+ * given. One kept at the open but pushed out of the ring before its turn (EVENTS_KEPT newer ones
+ * meanwhile) can't be given: the walk goes on past it and counts it in `cursor->lost`, whatever
+ * its kind, so the `lost` and seq from the open no longer describe what was given. A caller that
+ * has already sent those must not let its reply pass for a whole one.
  */
 typedef struct {
     uint32_t next, last;        /* counts from 1, not seqs */
     events_mask_t mask;
+    uint32_t lost;              /* pushed out before their turn, since the open */
 } events_cursor_t;
 uint16_t events_open(uint16_t after, events_mask_t mask, events_cursor_t *cursor, uint32_t *lost);
 bool events_next(events_cursor_t *cursor, events_each_fn_t cb, void *ctx);

@@ -276,6 +276,15 @@ static esp_err_t send_history(httpd_req_t *req, uint16_t after, events_mask_t ma
     esp_err_t err = ESP_OK;
     while (more && err == ESP_OK && !h.text.failed) {
         more = events_next(&cursor, add_json, &h);
+        if (cursor.lost != 0) {
+            /* One due in this reply was pushed out of the ring during the send (EVENTS_KEPT
+             * newer ones meanwhile): the seq and lost at its head would be wrong, and a client
+             * going on from that seq would never have it. The connection is closed instead, as
+             * for out of memory below; asked again, the store gives a reply that adds up. */
+            ESP_LOGD(TAG, "history: %lu pushed out during the reply; closing it", (unsigned long)cursor.lost);
+            free(h.text.buf);
+            return ESP_FAIL;
+        }
         if (!more) {
             append(&h.text, "]}");
         }
