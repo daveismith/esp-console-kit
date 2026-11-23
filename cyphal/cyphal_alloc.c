@@ -231,36 +231,60 @@ cyphal_alloc_blob_t cyphal_alloc_decode(cyphal_alloc_table_t *t, const uint8_t *
     return *dropped > 0 ? CYPHAL_ALLOC_BLOB_TRUNCATED : CYPHAL_ALLOC_BLOB_OK;
 }
 
-void cyphal_alloc_recent_note(cyphal_alloc_recent_t *r, uint8_t node_id, int64_t now_us)
+void cyphal_alloc_recent_init(cyphal_alloc_recent_t *r, cyphal_alloc_recent_entry_t *entries, size_t capacity)
 {
-    size_t oldest = 0;
-    for (size_t i = 0; i < CYPHAL_ALLOC_RECENT; i++) {
-        if (r->node_id[i] == node_id) {
-            oldest = i;
+    r->entries = entries;
+    r->capacity = entries != NULL ? capacity : 0;
+    cyphal_alloc_recent_clear(r);
+}
+
+void cyphal_alloc_recent_clear(cyphal_alloc_recent_t *r)
+{
+    for (size_t i = 0; i < r->capacity; i++) {
+        r->entries[i] = (cyphal_alloc_recent_entry_t){ .node_id = CYPHAL_NODE_ID_AUTO, .at_us = INT64_MIN };
+    }
+}
+
+static bool recent_young(const cyphal_alloc_recent_entry_t *e, int64_t now_us)
+{
+    return e->at_us != INT64_MIN && now_us - e->at_us < CYPHAL_ALLOC_RECENT_US;
+}
+
+bool cyphal_alloc_recent_note(cyphal_alloc_recent_t *r, uint8_t node_id, int64_t now_us)
+{
+    size_t slot = r->capacity;
+    for (size_t i = 0; i < r->capacity; i++) {
+        if (r->entries[i].node_id == node_id && r->entries[i].at_us != INT64_MIN) {
+            slot = i;       /* its own: young or not */
             break;
         }
-        if (r->at_us[i] < r->at_us[oldest]) {
-            oldest = i;
+        if (slot == r->capacity && !recent_young(&r->entries[i], now_us)) {
+            slot = i;       /* the first free or expired one, unless its own comes later */
         }
     }
-    r->node_id[oldest] = node_id;
-    r->at_us[oldest] = now_us;
+    if (slot == r->capacity) {
+        return false;       /* every entry young: none forgotten */
+    }
+    r->entries[slot] = (cyphal_alloc_recent_entry_t){ .node_id = node_id, .at_us = now_us };
+    return true;
 }
 
 bool cyphal_alloc_recent_has(const cyphal_alloc_recent_t *r, uint8_t node_id, int64_t now_us)
 {
-    for (size_t i = 0; i < CYPHAL_ALLOC_RECENT; i++) {
-        if (r->node_id[i] == node_id && r->at_us[i] != INT64_MIN && now_us - r->at_us[i] < CYPHAL_ALLOC_RECENT_US) {
+    for (size_t i = 0; i < r->capacity; i++) {
+        if (r->entries[i].node_id == node_id && recent_young(&r->entries[i], now_us)) {
             return true;
         }
     }
     return false;
 }
 
-void cyphal_alloc_recent_clear(cyphal_alloc_recent_t *r)
+bool cyphal_alloc_recent_full(const cyphal_alloc_recent_t *r, int64_t now_us)
 {
-    for (size_t i = 0; i < CYPHAL_ALLOC_RECENT; i++) {
-        r->node_id[i] = CYPHAL_NODE_ID_AUTO;
-        r->at_us[i] = INT64_MIN;
+    for (size_t i = 0; i < r->capacity; i++) {
+        if (!recent_young(&r->entries[i], now_us)) {
+            return false;
+        }
     }
+    return true;
 }

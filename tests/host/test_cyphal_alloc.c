@@ -198,7 +198,9 @@ static void test_blob(void)
     uint8_t bad[sizeof(blob)];
     memcpy(bad, blob, n);
     bad[0] = 2;     /* a later version: not read, and the caller says it will be saved over */
+    CHECK(cyphal_alloc_decode(&back, blob, n, &dropped) == CYPHAL_ALLOC_BLOB_OK && back.count == 3);
     CHECK(cyphal_alloc_decode(&back, bad, n, &dropped) == CYPHAL_ALLOC_BLOB_NEWER && back.count == 0);
+    CHECK(cyphal_alloc_decode(&back, bad, 1, &dropped) == CYPHAL_ALLOC_BLOB_NEWER);    /* the version alone decides */
     bad[0] = 0;
     CHECK(cyphal_alloc_decode(&back, bad, n, &dropped) == CYPHAL_ALLOC_BLOB_BAD && back.count == 0);
     CHECK(cyphal_alloc_decode(&back, blob, n - 1, &dropped) == CYPHAL_ALLOC_BLOB_BAD);
@@ -253,43 +255,59 @@ static void test_own(void)
     CHECK(cyphal_alloc_serve(&t, 0xBBB, 100, 119, 101, NULL, NULL, &id) == CYPHAL_ALLOC_NEW && id == 102);
 }
 
+/* The node's alloc_busy() without the bus: answered lately, or every entry young (full, taken before serving) */
 typedef struct {
     const cyphal_alloc_recent_t *r;
     int64_t now;
+    bool full;
 } recent_ctx_t;
 
 static bool busy_recent(void *ctx, uint8_t node_id)
 {
     const recent_ctx_t *c = ctx;
-    return cyphal_alloc_recent_has(c->r, node_id, c->now);
+    return c->full || cyphal_alloc_recent_has(c->r, node_id, c->now);
 }
 
 static void test_recent(void)
 {
+    cyphal_alloc_recent_entry_t entries[4];
     cyphal_alloc_recent_t r;
-    cyphal_alloc_recent_clear(&r);
+    cyphal_alloc_recent_init(&r, entries, 4);
     const int64_t S = 1000000;
-    CHECK(!cyphal_alloc_recent_has(&r, 100, 0));
-    cyphal_alloc_recent_note(&r, 100, 10 * S);
+    CHECK(!cyphal_alloc_recent_has(&r, 100, 0) && !cyphal_alloc_recent_full(&r, 0));
+    CHECK(cyphal_alloc_recent_note(&r, 100, 10 * S));
     CHECK(cyphal_alloc_recent_has(&r, 100, 10 * S) && cyphal_alloc_recent_has(&r, 100, 12 * S - 1));
     CHECK(!cyphal_alloc_recent_has(&r, 100, 12 * S) && !cyphal_alloc_recent_has(&r, 101, 10 * S));
     /* Noted again: its own entry moves on, the others stay */
-    cyphal_alloc_recent_note(&r, 101, 11 * S);
-    cyphal_alloc_recent_note(&r, 100, 11 * S);
+    CHECK(cyphal_alloc_recent_note(&r, 101, 11 * S));
+    CHECK(cyphal_alloc_recent_note(&r, 100, 11 * S));
     CHECK(cyphal_alloc_recent_has(&r, 100, 12 * S) && cyphal_alloc_recent_has(&r, 101, 12 * S));
-    /* Full: the oldest goes */
-    cyphal_alloc_recent_note(&r, 102, 11 * S + 1);
-    cyphal_alloc_recent_note(&r, 103, 11 * S + 2);
-    cyphal_alloc_recent_note(&r, 104, 11 * S + 3);
-    CHECK(cyphal_alloc_recent_has(&r, 104, 12 * S) && cyphal_alloc_recent_has(&r, 102, 12 * S));
-    CHECK(!cyphal_alloc_recent_has(&r, 100, 12 * S) && cyphal_alloc_recent_has(&r, 101, 12 * S));  /* the oldest went */
+    /* Full of young entries: a new one is refused and none forgotten (nothing replaced, nothing reopened) */
+    CHECK(cyphal_alloc_recent_note(&r, 102, 11 * S + 1));
+    CHECK(cyphal_alloc_recent_note(&r, 103, 11 * S + 2));
+    CHECK(cyphal_alloc_recent_full(&r, 11 * S + 3));
+    CHECK(!cyphal_alloc_recent_note(&r, 104, 11 * S + 3));
+    CHECK(!cyphal_alloc_recent_has(&r, 104, 11 * S + 3));
+    CHECK(cyphal_alloc_recent_has(&r, 100, 12 * S) && cyphal_alloc_recent_has(&r, 101, 12 * S) &&
+          cyphal_alloc_recent_has(&r, 102, 12 * S) && cyphal_alloc_recent_has(&r, 103, 12 * S));
+    /* ... but one already in it still moves on */
+    CHECK(cyphal_alloc_recent_note(&r, 102, 11 * S + 4));
+    /* Once an entry is 2 s old it is free: the new one takes it, the young ones stay */
+    CHECK(!cyphal_alloc_recent_full(&r, 13 * S));
+    CHECK(cyphal_alloc_recent_note(&r, 104, 13 * S));
+    CHECK(cyphal_alloc_recent_has(&r, 104, 13 * S) && cyphal_alloc_recent_has(&r, 102, 13 * S));
+    /* No entries at all: always full, nothing noted */
+    cyphal_alloc_recent_t none;
+    cyphal_alloc_recent_init(&none, NULL, 4);
+    CHECK(none.capacity == 0 && cyphal_alloc_recent_full(&none, 0) && !cyphal_alloc_recent_note(&none, 100, 0));
+
     /* As cyphal_alloc_pick()'s busy, the node does: a row given and forgotten at once is not given again while
      * recent, and is once the time has passed */
     cyphal_alloc_row_t rows[CAP];
     cyphal_alloc_table_t t;
     cyphal_alloc_table_init(&t, rows, CAP);
     cyphal_alloc_recent_clear(&r);
-    recent_ctx_t ctx = { &r, 20 * S };
+    recent_ctx_t ctx = { &r, 20 * S, false };
     uint8_t id = 0;
     CHECK(cyphal_alloc_serve(&t, 0xA, 100, 101, 52, busy_recent, &ctx, &id) == CYPHAL_ALLOC_NEW && id == 100);
     cyphal_alloc_recent_note(&r, id, ctx.now);
@@ -298,6 +316,45 @@ static void test_recent(void)
     cyphal_alloc_table_clear(&t);
     ctx.now += CYPHAL_ALLOC_RECENT_US;
     CHECK(cyphal_alloc_serve(&t, 0xC, 100, 101, 52, busy_recent, &ctx, &id) == CYPHAL_ALLOC_NEW && id == 100);
+}
+
+/* The eviction case: a burst of answers to other node-IDs can't push a young entry out and reopen its 2 s. With
+ * every entry young the node treats every node-ID as busy: the new request is refused, the rows still answer */
+static void test_recent_burst(void)
+{
+    const int64_t S = 1000000;
+    cyphal_alloc_recent_entry_t entries[4];
+    cyphal_alloc_recent_t r;
+    cyphal_alloc_recent_init(&r, entries, 4);
+    cyphal_alloc_row_t rows[CAP];
+    cyphal_alloc_table_t t;
+    cyphal_alloc_table_init(&t, rows, CAP);
+    recent_ctx_t ctx = { &r, 30 * S, false };
+    uint8_t id = 0;
+    /* 100 given, then forgotten at once (`cyphal allocations forget 100`) */
+    CHECK(cyphal_alloc_serve(&t, 0xA0, 100, 119, 52, busy_recent, &ctx, &id) == CYPHAL_ALLOC_NEW && id == 100);
+    CHECK(cyphal_alloc_recent_note(&r, id, ctx.now));
+    cyphal_alloc_table_forget(&t, 100);
+    /* Three more given within the 2 s: four young entries */
+    for (uint64_t p = 0xA1; p <= 0xA3; p++) {
+        ctx.now += 100000;
+        ctx.full = cyphal_alloc_recent_full(&r, ctx.now);
+        CHECK(cyphal_alloc_serve(&t, p, 100, 119, 52, busy_recent, &ctx, &id) == CYPHAL_ALLOC_NEW && id != 100);
+        CHECK(cyphal_alloc_recent_note(&r, id, ctx.now));
+    }
+    /* A fifth new one: refused (no node-ID), where the old 4-entry memory evicted 100 and gave it */
+    ctx.now += 100000;
+    ctx.full = cyphal_alloc_recent_full(&r, ctx.now);
+    CHECK(ctx.full);
+    CHECK(cyphal_alloc_serve(&t, 0xA4, 100, 119, 52, busy_recent, &ctx, &id) == CYPHAL_ALLOC_NO_ID && t.count == 3);
+    CHECK(cyphal_alloc_recent_has(&r, 100, ctx.now));
+    /* A known row still answers */
+    CHECK(cyphal_alloc_serve(&t, 0xA1, 100, 119, 52, busy_recent, &ctx, &id) == CYPHAL_ALLOC_KNOWN);
+    /* 2 s after 100 was answered its entry is free: the fifth gets a node-ID, never 100 while it was young */
+    ctx.now = 30 * S + CYPHAL_ALLOC_RECENT_US;
+    ctx.full = cyphal_alloc_recent_full(&r, ctx.now);
+    CHECK(!ctx.full);
+    CHECK(cyphal_alloc_serve(&t, 0xA4, 100, 119, 52, busy_recent, &ctx, &id) == CYPHAL_ALLOC_NEW && id == 100);
 }
 
 int main(void)
@@ -311,6 +368,7 @@ int main(void)
     test_blob_given_first();
     test_own();
     test_recent();
+    test_recent_burst();
     printf("cyphal_alloc: %d checks, %d failed\n", s_checks, s_failed);
     return s_failed ? 1 : 0;
 }

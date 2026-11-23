@@ -109,8 +109,8 @@ typedef enum {
     CYPHAL_ALLOC_BLOB_OK,
     CYPHAL_ALLOC_BLOB_TRUNCATED,    /* more rows than the table holds: given rows kept first, then heard ones, in
                                      * their order, as many as fit; the rest counted in *dropped */
-    CYPHAL_ALLOC_BLOB_NEWER,        /* a later version of the saved form: the table left empty (a row added
-                                     * saves over it) */
+    CYPHAL_ALLOC_BLOB_NEWER,        /* a later version of the saved form: the table left empty (the node then
+                                     * adds, answers and saves nothing until `cyphal allocations clear`) */
     CYPHAL_ALLOC_BLOB_BAD,          /* not a table of this version (size, version, a node-ID over 127, a
                                      * node-ID or a pseudo-ID twice): the table left empty */
 } cyphal_alloc_blob_t;
@@ -120,30 +120,44 @@ cyphal_alloc_blob_t cyphal_alloc_decode(cyphal_alloc_table_t *t, const uint8_t *
 
 /* The node-IDs answered lately: an allocatee holds an allocation about 1 s before it sends anything as that node-ID,
  * so a row forgotten or cleared meanwhile would let the node-ID be given again with nobody heard using it. An
- * answered node-ID counts as taken for CYPHAL_ALLOC_RECENT_US; the CYPHAL_ALLOC_RECENT latest are kept */
-#define CYPHAL_ALLOC_RECENT     4
+ * answered node-ID counts as taken for CYPHAL_ALLOC_RECENT_US. An entry younger than that is never replaced by
+ * another node-ID: with every entry young (cyphal_alloc_recent_full()) the caller gives no new node-ID, rather than
+ * forget one. The caller owns the entries; the node keeps twice its table's rows, which only forgets inside 2 s
+ * could fill */
 #define CYPHAL_ALLOC_RECENT_US  2000000
 typedef struct {
-    uint8_t node_id[CYPHAL_ALLOC_RECENT];
-    int64_t at_us[CYPHAL_ALLOC_RECENT];     /* INT64_MIN: none */
+    uint8_t node_id;
+    int64_t at_us;                  /* INT64_MIN: none */
+} cyphal_alloc_recent_entry_t;
+typedef struct {
+    cyphal_alloc_recent_entry_t *entries;
+    size_t capacity;                /* 0 (no entries): always full, so nothing new is given */
 } cyphal_alloc_recent_t;
 
+void cyphal_alloc_recent_init(cyphal_alloc_recent_t *r, cyphal_alloc_recent_entry_t *entries, size_t capacity);
+/* Every entry none */
 void cyphal_alloc_recent_clear(cyphal_alloc_recent_t *r);
-/* node_id answered at now_us: replaces its own entry, or the oldest */
-void cyphal_alloc_recent_note(cyphal_alloc_recent_t *r, uint8_t node_id, int64_t now_us);
+/* node_id answered at now_us: its own entry moved on, or a free or expired one taken. False, and nothing changed,
+ * if it has none and every entry is younger than CYPHAL_ALLOC_RECENT_US */
+bool cyphal_alloc_recent_note(cyphal_alloc_recent_t *r, uint8_t node_id, int64_t now_us);
 /* Whether node_id was answered within CYPHAL_ALLOC_RECENT_US before now_us */
 bool cyphal_alloc_recent_has(const cyphal_alloc_recent_t *r, uint8_t node_id, int64_t now_us);
+/* Whether every entry is younger than CYPHAL_ALLOC_RECENT_US: a node-ID not yet in it couldn't be noted */
+bool cyphal_alloc_recent_full(const cyphal_alloc_recent_t *r, int64_t now_us);
 
 /* ------------------------------------------------------------------ the node's (cyphal.c) */
 
 typedef enum {
-    CYPHAL_ALLOCATOR_OFF,           /* the setting is off for this run, or the node isn't running */
+    CYPHAL_ALLOCATOR_OFF,           /* the setting is off for this run, or the node isn't running (set at its stop) */
     CYPHAL_ALLOCATOR_NEEDS_FIXED,   /* on, but the node-ID is plug-and-play: an allocator needs a fixed one */
     CYPHAL_ALLOCATOR_LISTENING,     /* on: quiet through the fixed node-ID's listen */
     CYPHAL_ALLOCATOR_ACTIVE,        /* on: answering requests */
     CYPHAL_ALLOCATOR_YIELDED,       /* another allocator answered on the bus: quiet until the node's next start */
     CYPHAL_ALLOCATOR_STOPPED,       /* the node stopped (its node-ID in use): until the next start */
     CYPHAL_ALLOCATOR_RESET,         /* a reset (`cyphal reset`, a factory reset) turned it off: until the next start */
+    CYPHAL_ALLOCATOR_NEWER_TABLE,   /* on, but the saved table is a later firmware's: it adds no row, answers nothing
+                                     * and saves nothing, so as not to overwrite it, until `cyphal allocations clear`
+                                     * and the node's next start */
 } cyphal_allocator_state_t;
 
 typedef struct {
@@ -153,11 +167,14 @@ typedef struct {
     uint8_t other;                  /* YIELDED: the other allocator's node-ID */
     uint8_t first, last;            /* the range (CONFIG_CYPHAL_ALLOCATOR_FIRST and _LAST) */
     size_t rows, heard_rows, capacity;  /* the table: rows, heard ones among them, of CONFIG_CYPHAL_ALLOCATOR_TABLE */
-    /* Since the node started: requests heard, rows added for them, requests answered from a row, requests that got
-     * no answer for want of room (a row or a node-ID), other allocators heard; requests whose row has the node's own
-     * node-ID (unanswered); answers not sent because the transmit queue was nearly full */
+    /* Since the node started: requests heard (every one, the shed ones too), rows added for them, requests answered
+     * from a row, requests that got no answer for want of room (a row, or a node-ID neither taken, in use nor
+     * answered in the last 2 s), other allocators heard; requests whose row has the node's own node-ID
+     * (unanswered); requests not answered because the transmit queue was nearly full (shed) */
     uint32_t requests, allocations, repeats, refused, yielded, own, shed;
     bool unsaved;                   /* a row added, or a save under way, not yet in NVS */
+    bool newer_table;               /* the saved table is a later firmware's (CYPHAL_ALLOCATOR_NEWER_TABLE): kept
+                                     * as it is until `cyphal allocations clear` */
 } cyphal_allocator_status_t;
 
 #ifdef ESP_PLATFORM
@@ -170,8 +187,11 @@ void cyphal_allocator_status(cyphal_allocator_status_t *out);
 size_t cyphal_allocator_rows(cyphal_alloc_row_t *out, size_t max);
 /* A row taken out, saved: its node-ID free again (ESP_ERR_NOT_FOUND for none) */
 esp_err_t cyphal_allocator_forget(uint8_t node_id);
-/* Every row taken out, saved */
+/* Every row taken out, saved (over a later firmware's saved table too) */
 esp_err_t cyphal_allocator_clear(void);
+/* Whether register `index` (cyphal_reg()) is the allocator's: applied at the node's next start, though not
+ * CYPHAL_REG_NEXT_START. Known by its write function, so an application register of the same name isn't it */
+bool cyphal_allocator_is_register(size_t index);
 #endif /* ESP_PLATFORM */
 
 #ifdef __cplusplus

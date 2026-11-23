@@ -84,7 +84,7 @@ static void print_allocator(bool always)
 {
     cyphal_allocator_status_t a;
     cyphal_allocator_status(&a);
-    if (!always && !a.saved && !a.running && a.rows == 0) {
+    if (!always && !a.saved && !a.running && a.rows == 0 && !a.newer_table) {
         return;
     }
     printf("  allocator: %s, node-IDs %u to %u", a.running ? "on" : "off", a.first, a.last);
@@ -107,6 +107,9 @@ static void print_allocator(bool always)
     case CYPHAL_ALLOCATOR_RESET:
         printf("; stopped by a reset, until the node's next start");
         break;
+    case CYPHAL_ALLOCATOR_NEWER_TABLE:
+        printf("; allocating nothing this run: the saved table %s a later firmware's", a.newer_table ? "is" : "was");
+        break;
     default:
         break;
     }
@@ -115,6 +118,10 @@ static void print_allocator(bool always)
            (unsigned)a.heard_rows, a.unsaved ? ", a row not saved yet" : "", (unsigned long)a.requests,
            (unsigned long)a.allocations, (unsigned long)a.repeats, (unsigned long)a.refused, (unsigned long)a.yielded,
            (unsigned long)a.own, (unsigned long)a.shed);
+    if (a.newer_table) {
+        printf("    the saved table is a later firmware's: kept unread, nothing added, answered or saved, until "
+               "`cyphal allocations clear` (which drops it) and the node's next start\n");
+    }
     if (a.saved != a.running) {
         printf("    %s from the node's next start (`cyphal restart`)\n", a.saved ? "on" : "off");
     }
@@ -264,8 +271,7 @@ static int cmd_register(int argc, char **argv)
 #if CONFIG_CYPHAL_PNP_ALLOCATOR
     /* The application's: in effect already. The allocator's register is kept as one of them but applies at the node's
      * next start, as the node's settings do */
-    if (!(cyphal_reg((size_t)index)->flags & CYPHAL_REG_NEXT_START) &&
-        strcmp(cyphal_reg((size_t)index)->name, CONFIG_CYPHAL_ALLOCATOR_REGISTER) != 0) {
+    if (!(cyphal_reg((size_t)index)->flags & CYPHAL_REG_NEXT_START) && !cyphal_allocator_is_register((size_t)index)) {
 #else
     if (!(cyphal_reg((size_t)index)->flags & CYPHAL_REG_NEXT_START)) {      /* the application's: in effect already */
 #endif

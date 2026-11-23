@@ -370,6 +370,7 @@ static void alloc_load(void);
 static void alloc_start(void);
 static void alloc_online(node_t *n);
 static void alloc_in_use(void);
+static void alloc_stop(void);
 static void alloc_worker(void);
 static void alloc_frame(node_t *n, const canbus_frame_t *f, cyphal_state_t state, int64_t stamp);
 static esp_err_t alloc_port_lists(node_t *n);
@@ -2162,6 +2163,9 @@ static esp_err_t stop_locked(void)
             s_bus = 0;
         }
     }
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+    alloc_stop();       /* the task has ended: the allocator is off until the next start */
+#endif
     if (err == ESP_OK) {
         s_state = CYPHAL_OFF;
     } else {
@@ -2289,14 +2293,21 @@ void cyphal_status(cyphal_status_t *out)
  * spinlock, and records it in s_alloc_saved_changes only once NVS has committed, so "unsaved" (the two differ) holds
  * through a save under way and after one that failed. Saves are made under s_lock, one at a time: by the worker, for
  * rows the node's task added (retried after a failure, 1 s and then doubling up to 30 s apart, woken by a timer), and
- * by the console, for its edits. The node's task never writes NVS, and a repeated request changes nothing.
- * The setting (s_alloc_saved) is written under s_lock and read anywhere; the state, the other allocator's node-ID and
- * the counters are written by the node's task (and by a start, before the task exists, and a reset) and read whole.
+ * by the console, for its edits; any save that commits ends the back-off. The node's task never writes NVS, and a
+ * repeated request changes nothing. While the saved table is a later firmware's (s_alloc_newer) nothing is added or
+ * saved, so that it isn't overwritten unread, until `cyphal allocations clear` or a reset.
+ * The setting (s_alloc_saved) is written under s_lock and read anywhere. The state is changed under the spinlock
+ * wherever a reset could come between its reading and its writing (the node's task, a reset), and by a start and a
+ * stop, under s_lock with the task not running; the other allocator's node-ID and the counters are written by the
+ * node's task (and by a start) and read whole.
  */
 
 #define ALLOC_FIRST     CONFIG_CYPHAL_ALLOCATOR_FIRST
 #define ALLOC_LAST      CONFIG_CYPHAL_ALLOCATOR_LAST
 #define ALLOC_BLOB_MAX  CYPHAL_ALLOC_BLOB_SIZE(CONFIG_CYPHAL_ALLOCATOR_TABLE)
+/* The node-IDs answered lately, remembered: twice the table, so that only forgets within 2 s could fill it with young
+ * entries (each answer is a row's node-ID), and then nothing new is given rather than an entry forgotten */
+#define ALLOC_RECENT    (2 * CONFIG_CYPHAL_ALLOCATOR_TABLE)
 #define KEY_ALLOC_ON    "pnp_alloc"     /* u8: the setting, 1 on; missing, off */
 #define KEY_ALLOC_TABLE "pnp_table"     /* blob: the table (cyphal_alloc_encode()); missing, empty */
 /* An answer is not queued while the transmit queue holds more than this: 32 frames are kept for the node's own
@@ -2322,7 +2333,7 @@ static portMUX_TYPE s_alloc_mux = portMUX_INITIALIZER_UNLOCKED;
 static cyphal_alloc_table_t s_alloc_table;      /* its rows in PSRAM, from cyphal_init() */
 static uint8_t *s_alloc_blob;                   /* the saved form's buffer, PSRAM, used under s_lock */
 static volatile bool s_alloc_saved;             /* the setting, from the next start */
-/* This start's: OFF unless the setting was on as it began, and OFF while the node doesn't run */
+/* This start's: OFF unless the setting was on as it began, and OFF while the node doesn't run (alloc_stop()) */
 static volatile cyphal_allocator_state_t s_alloc_state = CYPHAL_ALLOCATOR_OFF;
 static volatile uint8_t s_alloc_other = CYPHAL_NODE_ID_AUTO;   /* YIELDED: the other allocator's node-ID */
 static volatile uint32_t s_alloc_requests, s_alloc_allocations, s_alloc_repeats, s_alloc_refused, s_alloc_yielded,
@@ -2330,12 +2341,14 @@ static volatile uint32_t s_alloc_requests, s_alloc_allocations, s_alloc_repeats,
 static uint32_t s_alloc_changes;                /* the table's changes, counted: through __atomic only */
 static uint32_t s_alloc_saved_changes;          /* s_alloc_changes as last committed to NVS: through __atomic only */
 static esp_timer_handle_t s_alloc_retry;        /* wakes the worker to retry a save that failed */
-static int64_t s_alloc_retry_us;                /* the worker's: the wait before the next retry, 0 after a success */
-static int64_t s_alloc_retry_at;                /* the worker's: no save before this */
+static int64_t s_alloc_retry_us;                /* under s_lock: the wait before the next retry, 0 after a success */
+static int64_t s_alloc_retry_at;                /* under s_lock: the worker saves nothing before this */
 /* The node task's, for this start */
 static CanardTransferID s_alloc_tid;            /* the answers' transfer-ID */
 static bool s_alloc_full_logged, s_alloc_own_logged;    /* a refusal logged this start */
-static cyphal_alloc_recent_t s_alloc_recent;    /* node-IDs answered lately: taken even if their row goes */
+static cyphal_alloc_recent_t s_alloc_recent;    /* node-IDs answered lately: taken even if their row goes. Its
+                                                 * entries in PSRAM, from cyphal_init(); the node's task's */
+static volatile bool s_alloc_newer;             /* the saved table is a later firmware's: written under s_lock */
 static uint8_t *s_alloc_plain_list;             /* the port list without it, for once the allocator stops: PORT_LIST_MAX
                                                  * bytes in PSRAM, from cyphal_init() */
 static size_t s_alloc_plain_list_size;
@@ -2397,9 +2410,13 @@ static bool alloc_unsaved(void)
 }
 
 /* The table into NVS, under s_lock: encoded under the spinlock with the change count it holds, written outside it,
- * and that count recorded as saved once committed */
+ * and that count recorded as saved once committed, which also ends a failed save's back-off. Never over a later
+ * firmware's table (cyphal_allocator_clear() lets it go first) */
 static esp_err_t alloc_save_locked(void)
 {
+    if (s_alloc_newer) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (s_alloc_blob == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -2410,6 +2427,8 @@ static esp_err_t alloc_save_locked(void)
     const esp_err_t err = size == 0 ? ESP_ERR_INVALID_SIZE : alloc_nvs(put_table, &size);
     if (err == ESP_OK) {
         __atomic_store_n(&s_alloc_saved_changes, changes, __ATOMIC_RELEASE);
+        s_alloc_retry_us = 0;
+        s_alloc_retry_at = 0;
     }
     return err;
 }
@@ -2432,6 +2451,9 @@ static esp_err_t alloc_reset_locked(void)
     const esp_err_t err = alloc_nvs(erase_both, NULL);
     if (err == ESP_OK) {
         s_alloc_saved = false;
+        s_alloc_newer = false;      /* its key is gone too */
+        s_alloc_retry_us = 0;
+        s_alloc_retry_at = 0;
         taskENTER_CRITICAL(&s_alloc_mux);
         cyphal_alloc_table_clear(&s_alloc_table);
         if (s_alloc_state != CYPHAL_ALLOCATOR_OFF) {
@@ -2497,10 +2519,16 @@ static bool alloc_is_register(const cyphal_register_t *r)
     return r != NULL && r->write == alloc_reg_write;
 }
 
+bool cyphal_allocator_is_register(size_t index)
+{
+    return alloc_is_register(cyphal_reg(index));
+}
+
 /* cyphal_init()'s cyphal_reg_init(), with the allocator's register after the application's (a copy of the two, kept).
  * An application port whose NVS key is one of the allocator's is refused as the node's own keys are (no application
- * port or register kept); if the table can't keep the allocator's register, again without it, so that its name can't
- * cost the application its ports */
+ * port or register kept, the allocator's register kept); if the table can't keep the allocator's register, again
+ * without it, so that its name can't cost the application its ports; and if the application's ports or registers
+ * are what the table can't keep, the allocator's register alone, as for the key */
 static bool alloc_reg_init(char *why, size_t why_len)
 {
     for (size_t i = 0; s_app.ports != NULL && i < s_app.port_count; i++) {
@@ -2528,6 +2556,9 @@ static bool alloc_reg_init(char *why, size_t why_len)
     if (ok) {
         ESP_LOGE(TAG, "the allocator's register %s: %s; left out", CONFIG_CYPHAL_ALLOCATOR_REGISTER,
                  all == NULL ? "no memory" : "not a register name, or taken");
+    } else {
+        char again[64];     /* why stays the application's reason */
+        cyphal_reg_init(NULL, 0, CONFIG_CYPHAL_NAME_REGISTER, &ALLOC_REGISTER, 1, again, sizeof(again));
     }
     return ok;
 }
@@ -2560,8 +2591,10 @@ static void alloc_load_table(nvs_handle_t h)
                  "heard ones first, and saved without them when a row is next added", CONFIG_CYPHAL_ALLOCATOR_TABLE,
                  (unsigned)dropped);
     } else if (r == CYPHAL_ALLOC_BLOB_NEWER) {
-        ESP_LOGW(TAG, "allocator: the saved table is a later firmware's (version %u): not read, and overwritten when "
-                 "a row is next saved", version);
+        s_alloc_newer = true;
+        ESP_LOGW(TAG, "allocator: the saved table is a later firmware's (version %u): not read, and kept as it is; the "
+                 "allocator adds, answers and saves nothing until `cyphal allocations clear` (which drops it) and the "
+                 "node's next start", version);
     } else if (r == CYPHAL_ALLOC_BLOB_BAD) {
         ESP_LOGW(TAG, "allocator: the saved table (%u bytes) isn't one: empty, until a row added saves over it",
                  (unsigned)size);
@@ -2574,11 +2607,27 @@ static void alloc_load(void)
     cyphal_alloc_row_t *rows = psram_calloc(CONFIG_CYPHAL_ALLOCATOR_TABLE * sizeof(cyphal_alloc_row_t));
     s_alloc_blob = psram_calloc(ALLOC_BLOB_MAX);
     s_alloc_plain_list = psram_calloc(PORT_LIST_MAX);
+    cyphal_alloc_recent_entry_t *recent = psram_calloc(ALLOC_RECENT * sizeof(*recent));
     cyphal_alloc_table_init(&s_alloc_table, rows, CONFIG_CYPHAL_ALLOCATOR_TABLE);
-    cyphal_alloc_recent_clear(&s_alloc_recent);
+    cyphal_alloc_recent_init(&s_alloc_recent, recent, ALLOC_RECENT);
     const esp_timer_create_args_t retry = { .callback = alloc_retry_cb, .name = "cyphal_alloc" };
-    if (rows == NULL || s_alloc_blob == NULL || esp_timer_create(&retry, &s_alloc_retry) != ESP_OK) {
+    /* What each failure costs, said once */
+    if (rows == NULL) {
         ESP_LOGE(TAG, "allocator: no memory for its table: it answers nothing");
+    } else if (recent == NULL) {
+        ESP_LOGE(TAG, "allocator: no memory for the node-IDs answered lately: it answers its rows but gives no new "
+                 "node-ID");
+    }
+    if (rows != NULL && s_alloc_blob == NULL) {
+        ESP_LOGE(TAG, "allocator: no memory for the saved table's buffer: it answers, but saves no row");
+    }
+    if (esp_timer_create(&retry, &s_alloc_retry) != ESP_OK) {
+        s_alloc_retry = NULL;
+        ESP_LOGE(TAG, "allocator: no timer: a failed save is tried again only when the worker next wakes for "
+                 "something else");
+    }
+    if (s_alloc_plain_list == NULL) {
+        ESP_LOGE(TAG, "allocator: no memory for the second port list: the port list leaves out subject 8166");
     }
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
@@ -2642,6 +2691,11 @@ esp_err_t cyphal_allocator_clear(void)
         return ESP_ERR_INVALID_STATE;
     }
     lock();
+    if (s_alloc_newer) {
+        ESP_LOGW(TAG, "allocator: the later firmware's saved table dropped (`cyphal allocations clear`); allocating "
+                 "from the node's next start");
+        s_alloc_newer = false;      /* the operator's word: saved over from here */
+    }
     taskENTER_CRITICAL(&s_alloc_mux);
     cyphal_alloc_table_clear(&s_alloc_table);
     alloc_changed();
@@ -2659,6 +2713,7 @@ void cyphal_allocator_status(cyphal_allocator_status_t *out)
     }
     lock();
     out->saved = s_alloc_saved;
+    out->newer_table = s_alloc_newer;
     if (s_task != NULL) {       /* running: this start's state */
         out->state = s_alloc_state;
         out->running = s_alloc_state != CYPHAL_ALLOCATOR_OFF && s_alloc_state != CYPHAL_ALLOCATOR_RESET;
@@ -2684,33 +2739,36 @@ void cyphal_allocator_status(cyphal_allocator_status_t *out)
 
 /* ---- the worker's */
 
-/* Every turn: the table saved if it has changed since the last commit and no retry is pending. A failure is retried,
- * 1 s and then doubling up to 30 s apart (the timer wakes the worker), so a broken NVS costs a write a while, not a
- * spinning worker; one warning a run of failures */
+/* Every turn: the table saved if it has changed since the last commit and no retry is pending. Looked at again under
+ * s_lock, since a reset or a console save may have come since (a save queued before a reset mustn't make the erased
+ * key again). A failure is retried, 1 s and then doubling up to 30 s apart (the timer wakes the worker), so a broken
+ * NVS costs a write a while, not a spinning worker; one warning a run of failures */
 static void alloc_worker(void)
 {
-    const int64_t now = esp_timer_get_time();
-    if (!alloc_unsaved() || now < s_alloc_retry_at) {
+    if (!alloc_unsaved()) {
         return;
     }
     lock();
-    const esp_err_t err = alloc_save_locked();
-    unlock();
-    if (err == ESP_OK) {
-        s_alloc_retry_us = 0;
-        s_alloc_retry_at = 0;
+    const int64_t now = esp_timer_get_time();
+    if (!alloc_unsaved() || s_alloc_newer || now < s_alloc_retry_at) {
+        unlock();
         return;
     }
-    if (s_alloc_retry_us == 0) {
-        ESP_LOGW(TAG, "allocator: the table wasn't saved (%s): trying again, ever less often", esp_err_to_name(err));
+    const esp_err_t err = alloc_save_locked();
+    const bool first = err != ESP_OK && s_alloc_retry_us == 0;
+    if (err != ESP_OK) {
+        s_alloc_retry_us = s_alloc_retry_us == 0 ? ALLOC_RETRY_FIRST_US
+                           : s_alloc_retry_us * 2 > ALLOC_RETRY_MAX_US ? ALLOC_RETRY_MAX_US
+                                                                      : s_alloc_retry_us * 2;
+        s_alloc_retry_at = now + s_alloc_retry_us;
+        if (s_alloc_retry != NULL) {
+            esp_timer_stop(s_alloc_retry);
+            esp_timer_start_once(s_alloc_retry, (uint64_t)s_alloc_retry_us);
+        }
     }
-    s_alloc_retry_us = s_alloc_retry_us == 0 ? ALLOC_RETRY_FIRST_US
-                       : s_alloc_retry_us * 2 > ALLOC_RETRY_MAX_US ? ALLOC_RETRY_MAX_US
-                                                                  : s_alloc_retry_us * 2;
-    s_alloc_retry_at = now + s_alloc_retry_us;
-    if (s_alloc_retry != NULL) {
-        esp_timer_stop(s_alloc_retry);
-        esp_timer_start_once(s_alloc_retry, (uint64_t)s_alloc_retry_us);
+    unlock();
+    if (first) {
+        ESP_LOGW(TAG, "allocator: the table wasn't saved (%s): trying again, ever less often", esp_err_to_name(err));
     }
 }
 
@@ -2728,28 +2786,49 @@ static void alloc_start(void)
     s_alloc_full_logged = s_alloc_own_logged = false;
     s_alloc_state = !s_alloc_saved                         ? CYPHAL_ALLOCATOR_OFF
                     : s_run.node_id == CYPHAL_NODE_ID_AUTO ? CYPHAL_ALLOCATOR_NEEDS_FIXED
+                    : s_alloc_newer                        ? CYPHAL_ALLOCATOR_NEWER_TABLE
                                                            : CYPHAL_ALLOCATOR_LISTENING;
     if (s_alloc_state == CYPHAL_ALLOCATOR_NEEDS_FIXED) {
         ESP_LOGW(TAG, "allocator: on, but the node-ID is plug-and-play: an allocator needs a fixed node-ID "
                  "(`cyphal id <n>`), so it gives none");
+    } else if (s_alloc_state == CYPHAL_ALLOCATOR_NEWER_TABLE) {
+        ESP_LOGW(TAG, "allocator: on, but the saved table is a later firmware's: it answers nothing, so as not to save "
+                 "over it, until `cyphal allocations clear` and the node's next start");
     }
 }
 
-/* start_locked(), after serialize_port_list(): when the allocator will answer this run (on, a fixed node-ID), the
- * port list made again with subject 8166 published and subscribed, and the one without it kept, for port_list() to
- * send once the allocator stops (it yields, the node stops, a reset) */
+/* stop_locked(), the task ended: off until the next start, whatever stopped it */
+static void alloc_stop(void)
+{
+    taskENTER_CRITICAL(&s_alloc_mux);
+    s_alloc_state = CYPHAL_ALLOCATOR_OFF;
+    taskEXIT_CRITICAL(&s_alloc_mux);
+}
+
+/* start_locked(), after serialize_port_list(): when the allocator will answer this run (on, a fixed node-ID, no later
+ * firmware's table), the port list made again with subject 8166 published and subscribed, and the one without it
+ * kept, for port_list() to send once the allocator stops (it yields, the node stops, a reset). If the second can't be
+ * made (bigger than PORT_LIST_MAX, no memory), the plain one is the only one, logged once: never a failed start */
 static esp_err_t alloc_port_lists(node_t *n)
 {
+    static bool logged;
     s_alloc_plain_list_size = 0;    /* none: n->port_list is the only one this run */
-    if (!s_alloc_saved || s_run.node_id == CYPHAL_NODE_ID_AUTO || s_alloc_plain_list == NULL) {
+    if (!s_alloc_saved || s_run.node_id == CYPHAL_NODE_ID_AUTO || s_alloc_newer || s_alloc_plain_list == NULL) {
         return ESP_OK;
     }
-    memcpy(s_alloc_plain_list, n->port_list, n->port_list_size);
-    s_alloc_plain_list_size = n->port_list_size;
+    const size_t plain = n->port_list_size;
+    memcpy(s_alloc_plain_list, n->port_list, plain);
     s_alloc_port_listed = true;
-    const esp_err_t err = serialize_port_list(n);
+    const esp_err_t err = serialize_port_list(n);      /* n->port_list as it was unless it succeeds */
     s_alloc_port_listed = false;
-    return err;
+    if (err == ESP_OK) {
+        s_alloc_plain_list_size = plain;
+    } else if (!logged) {
+        logged = true;
+        ESP_LOGW(TAG, "allocator: the port list with subject 8166 couldn't be made (%s): the plain one is sent",
+                 esp_err_to_name(err));
+    }
+    return ESP_OK;
 }
 
 /* port_list(): the list to send now. With the allocator answering, its subject is in it */
@@ -2763,25 +2842,35 @@ static const uint8_t *alloc_port_list(const node_t *n, size_t *size)
     return s_alloc_plain_list;
 }
 
-/* go_online(): quiet through the listen, answering from now, unless another allocator was heard in it */
+/* go_online(): quiet through the listen, answering from now, unless another allocator was heard in it or a reset
+ * came. The state moves under the spinlock, where a reset changes it, so that a reset's RESET is never overwritten;
+ * subscribed only once it has moved (a reset after that leaves the subscription, which on_alloc_request() ignores) */
 static void alloc_online(node_t *n)
 {
-    if (s_alloc_state != CYPHAL_ALLOCATOR_LISTENING) {
+    taskENTER_CRITICAL(&s_alloc_mux);
+    const bool answer = s_alloc_state == CYPHAL_ALLOCATOR_LISTENING;
+    if (answer) {
+        s_alloc_state = CYPHAL_ALLOCATOR_ACTIVE;
+    }
+    taskEXIT_CRITICAL(&s_alloc_mux);
+    if (!answer) {
         return;
     }
     canardRxSubscribe(&n->canard, CanardTransferKindMessage, ALLOC_SERVE.port_id, ALLOC_SERVE.extent,
                       CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC, &n->allocation);
     n->allocation.user_reference = (void *)&ALLOC_SERVE;
-    s_alloc_state = CYPHAL_ALLOCATOR_ACTIVE;
     ESP_LOGI(TAG, "allocator: answering plug-and-play requests with node-IDs %d to %d", ALLOC_FIRST, ALLOC_LAST);
 }
 
-/* stop_in_use(): the node sends nothing now, and on_frame() no longer hands frames to libcanard */
+/* stop_in_use(): the node sends nothing now, and on_frame() no longer hands frames to libcanard. Under the spinlock,
+ * so that a reset's RESET stays the reason */
 static void alloc_in_use(void)
 {
+    taskENTER_CRITICAL(&s_alloc_mux);
     if (s_alloc_state == CYPHAL_ALLOCATOR_LISTENING || s_alloc_state == CYPHAL_ALLOCATOR_ACTIVE) {
         s_alloc_state = CYPHAL_ALLOCATOR_STOPPED;
     }
+    taskEXIT_CRITICAL(&s_alloc_mux);
 }
 
 /* Whether the allocator may change the table now: in the listen or answering. Read under the spinlock, where a reset
@@ -2794,14 +2883,18 @@ static bool alloc_may_add(void)
 typedef struct {
     const node_t *n;
     int64_t now;
+    bool recent_full;       /* cyphal_alloc_recent_full() as of now: taken once, before the spinlock */
 } alloc_busy_t;
 
 /* cyphal_alloc_pick()'s "in use": heard within a heartbeat's offline timeout (the node's cyphal_seen_t, fed here), or
- * answered within CYPHAL_ALLOC_RECENT_US (an allocatee holds its allocation about 1 s before it is heard) */
+ * answered within CYPHAL_ALLOC_RECENT_US (an allocatee holds its allocation about 1 s before it is heard). With every
+ * entry of the answered-lately list young, every node-ID counts as in use: a new one couldn't be remembered, and
+ * forgetting a young one would reopen its 2 s (so the request is refused, counted) */
 static bool alloc_busy(void *ctx, uint8_t node_id)
 {
     const alloc_busy_t *b = ctx;
-    return cyphal_pnp_in_use(&b->n->seen, node_id, b->now) || cyphal_alloc_recent_has(&s_alloc_recent, node_id, b->now);
+    return b->recent_full || cyphal_pnp_in_use(&b->n->seen, node_id, b->now) ||
+           cyphal_alloc_recent_has(&s_alloc_recent, node_id, b->now);
 }
 
 /* on_frame(), every frame, before libcanard sees it, while the allocator may answer (on, the fixed node-ID listening
@@ -2872,7 +2965,7 @@ static void on_alloc_request(node_t *n, const service_t *svc, const struct Canar
         s_alloc_shed++;
         return;
     }
-    alloc_busy_t busy = { n, now };
+    alloc_busy_t busy = { n, now, cyphal_alloc_recent_full(&s_alloc_recent, now) };
     uint8_t id = 0;
     cyphal_alloc_result_t r = CYPHAL_ALLOC_FULL;
     bool stopped = false;
@@ -2905,7 +2998,7 @@ static void on_alloc_request(node_t *n, const service_t *svc, const struct Canar
             ESP_LOGW(TAG, "allocator: no node-ID for pseudo-ID %012llx: %s; not answered (and not logged again this "
                      "start)", (unsigned long long)pseudo,
                      r == CYPHAL_ALLOC_FULL ? "the table is full (`cyphal allocations`)"
-                                            : "every node-ID in the range is taken or in use");
+                                            : "every node-ID in the range is taken, in use or answered lately");
         }
         return;
     }
@@ -2916,7 +3009,9 @@ static void on_alloc_request(node_t *n, const service_t *svc, const struct Canar
     } else {
         s_alloc_repeats++;
     }
-    cyphal_alloc_recent_note(&s_alloc_recent, id, now);
+    /* Never false for a new row's node-ID (alloc_busy() refused one that couldn't be noted); for a known row's, false
+     * leaves its row to protect it */
+    (void)cyphal_alloc_recent_note(&s_alloc_recent, id, now);
     uint8_t buf[CYPHAL_ALLOC_REPLY_SIZE];
     const size_t size = cyphal_alloc_reply(buf, sizeof(buf), pseudo, id);
     if (size == 0) {        /* never: every row's node-ID is 0-127 */

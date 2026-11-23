@@ -159,8 +159,8 @@ menu "Cyphal node (cyphal)"
             The kit's README ("cyphal") has the rules. Off, nothing of it is compiled: no setting,
             register, console word or code. Costs, on (measured on the dome panel's ESP32-P4,
             2026-11-22): 8.8 KB of code in flash, 200 bytes of static internal RAM, the table in
-            PSRAM (8 bytes a row, and as much again for its saved form), a subscription in
-            libcanard's heap while it answers, and two frames on the bus per request answered.
+            PSRAM (CONFIG_CYPHAL_ALLOCATOR_TABLE says how much), a subscription in libcanard's
+            heap while it answers, and two frames on the bus per request answered.
 
     config CYPHAL_ALLOCATOR_FIRST
         int "The first node-ID the allocator gives"
@@ -188,8 +188,9 @@ menu "Cyphal node (cyphal)"
         default 16
         range 1 64
         help
-            How many nodes it remembers (rows given and rows heard). 8 bytes a row in PSRAM, and as
-            much again for the saved form's buffer; the NVS blob is 2 bytes and 8 a row. A full
+            How many nodes it remembers (rows given and rows heard). In PSRAM, 56 bytes a row: the
+            row itself (16, padded), the saved form's buffer (8), and two entries of the list of
+            node-IDs answered in the last 2 s (16 each). The NVS blob is 2 bytes and 8 a row. A full
             table answers nothing new; the rows it has still answer.
 
     config CYPHAL_ALLOCATOR_REGISTER

@@ -234,14 +234,24 @@ Notes:
       marked heard and never given (the spec's mock entry).
     - A full table, or a range with nothing free, gets no answer (the spec's rule), counted and
       logged once a start. A row is saved by the worker when it is added, never once per
-      request.
+      request; a save that fails is tried again 1 s later, then ever less often up to every
+      30 s, with one warning, and any save that commits (the console's too) ends that back-off.
+    - A saved table from a later firmware (a newer blob version) is not read and not
+      overwritten: while it is there the allocator, if on, adds no row, answers nothing and
+      saves nothing, and `cyphal` and a boot warning say so, until `cyphal allocations clear`
+      (which drops it) and the node's next start.
     - `cyphal allocations` lists the table; `forget <id>` and `clear` edit it (the spec's table
-      only grows; these are the operator's way out). `cyphal reset` and a factory reset over
+      only grows; these are the operator's way out; `forget` on a node that is online turns its
+      row into a heard one within a heartbeat or two, so its next ask gets a new node-ID: seen
+      with a real holo on the dome panel, 2026-11-22). `cyphal reset` and a factory reset over
       Cyphal turn the setting off and empty the table.
     - Keyed by pseudo-ID alone: the node makes no client calls, so no `GetInfo` follow-up.
     - What it costs, on the dome panel's ESP32-P4 (2026-11-22): 8.8 KB of code, 200 bytes of
       static internal RAM, the table in PSRAM; through 200 requests a second for a minute, no
       NVS write, heartbeats 0.99-1.01 s apart, libcanard's heap 2,100 bytes at most.
+    - With a real holo wired to the panel (2026-11-22), it was online on its row's node-ID
+      (100) 1.3 to 2.9 s after each of its own restarts: the holo holds an allocation about
+      1 s before it is heard.
     - Without the option nothing of it is compiled: `cyphal_alloc.c` is left out of the
       component, and the calls into it from `cyphal.c` and `cmd_cyphal.c` are under `#if`, so
       the objects' code and data are what they were, but for one value: `ESP_ERROR_CHECK`'s
@@ -252,9 +262,13 @@ Notes:
       answered (`cyphal allocations forget` it). An answer is not queued while the transmit
       queue is nearly full (128 of 160 frames), so a request storm can't starve the heartbeat.
       A node-ID answered in the last 2 s counts as taken even if its row was just forgotten
-      (the allocatee holds it about 1 s before it is heard). A `clear` while nodes in the
-      range are online makes each a heard row at its next heartbeat. The port list names
-      subject 8166 while the allocator answers.
+      (the allocatee holds it about 1 s before it is heard); the node remembers twice its
+      table's rows of those answers and never pushes out one younger than 2 s, so if every
+      entry were young it would give no new node-ID (refused, counted) rather than forget
+      one. A `clear` while nodes in the range are online makes each a heard row at its next
+      heartbeat. The port list names subject 8166 only while the allocator answers (not once
+      it has yielded or been reset). A save queued before a reset does not write the erased
+      table back.
   - Host tests: `make -C tests/host` builds `cyphal_util.c`, `cyphal_registers.c` and
     `cyphal_alloc.c` with the computer's `cc` and runs them (no ESP-IDF).
   - Clone recursively: libcanard and the DSDL are submodules under `third_party/`, which IDF
