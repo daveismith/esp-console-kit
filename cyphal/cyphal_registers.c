@@ -5,8 +5,23 @@
 #include <stdio.h>
 #include <string.h>
 #include "cyphal_registers.h"
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"          /* CONFIG_CYPHAL_CLIENT; tests/host gives it with -D */
+#endif
 
 #define NODE_REGISTERS  3       /* the node-ID, the name, the bitrate; then two for each port */
+
+#if CONFIG_CYPHAL_CLIENT
+/* Whether a port of this kind has a service-ID (one it serves, or one it calls), and the set its ID is one of:
+ * subjects (0), services served (1), services called (2) */
+#define HAS_SERVICE_ID(kind) ((kind) == CYPHAL_PORT_SRV || (kind) == CYPHAL_PORT_CLI)
+#define ID_SET(kind)         ((kind) == CYPHAL_PORT_CLI ? 2 : (kind) == CYPHAL_PORT_SRV)
+typedef int id_set_t;
+#else
+#define HAS_SERVICE_ID(kind) ((kind) == CYPHAL_PORT_SRV)
+#define ID_SET(kind)         ((kind) == CYPHAL_PORT_SRV)
+typedef bool id_set_t;
+#endif
 
 /* The node's own registers, built by cyphal_reg_init(): NODE_REGISTERS, then each port's .id and .type */
 static cyphal_register_t s_own[NODE_REGISTERS + 2 * CYPHAL_PORTS_MAX];
@@ -20,7 +35,7 @@ static size_t s_fixed_count;
 
 bool cyphal_port_id_valid(cyphal_port_kind_t kind, uint32_t id)
 {
-    return id == CYPHAL_PORT_OFF || id <= (kind == CYPHAL_PORT_SRV ? CYPHAL_SERVICE_ID_MAX : CYPHAL_SUBJECT_ID_MAX);
+    return id == CYPHAL_PORT_OFF || id <= (HAS_SERVICE_ID(kind) ? CYPHAL_SERVICE_ID_MAX : CYPHAL_SUBJECT_ID_MAX);
 }
 
 void cyphal_reg_fixed(const cyphal_fixed_port_t *fixed, size_t count)
@@ -28,6 +43,15 @@ void cyphal_reg_fixed(const cyphal_fixed_port_t *fixed, size_t count)
     s_fixed = fixed;
     s_fixed_count = fixed != NULL ? count : 0;
 }
+
+#if CONFIG_CYPHAL_CLIENT
+static bool (*s_called)(uint16_t id);   /* the standard services the node calls (cyphal_reg_called()) */
+
+void cyphal_reg_called(bool (*fixed)(uint16_t id))
+{
+    s_called = fixed;
+}
+#endif
 
 /* cyphal_port_id_free()'s rule over a table and its IDs: whether `id`, for a port of `kind` at `index`, is
  * one of the node's own ports' or one of ports[0 .. upto)'s in ids[] (index skipped). True, with why */
@@ -37,17 +61,24 @@ static bool id_taken(const cyphal_port_t *ports, const uint16_t *ids, size_t upt
     if (id == CYPHAL_PORT_OFF) {
         return false;
     }
-    const bool service = kind == CYPHAL_PORT_SRV;
-    const char *what = service ? "service" : "subject";
+    const id_set_t set = ID_SET(kind);
+    const char *what = set ? "service" : "subject";
     for (size_t i = 0; i < s_fixed_count; i++) {
-        if ((s_fixed[i].kind == CYPHAL_PORT_SRV) == service && s_fixed[i].id == id) {
+        if (ID_SET(s_fixed[i].kind) == set && s_fixed[i].id == id) {
             snprintf(why, why_len, "%s %u is one of the node's own ports (uavcan.node.port.List lists them)", what,
                      (unsigned)id);
             return true;
         }
     }
+#if CONFIG_CYPHAL_CLIENT
+    if (set == ID_SET(CYPHAL_PORT_CLI) && s_called != NULL && id <= UINT16_MAX && s_called((uint16_t)id)) {
+        snprintf(why, why_len, "%s %u is one of the node's own ports (uavcan.node.port.List lists them)", what,
+                 (unsigned)id);
+        return true;
+    }
+#endif
     for (size_t j = 0; j < upto; j++) {
-        if (j != index && (ports[j].kind == CYPHAL_PORT_SRV) == service && ids[j] == id) {
+        if (j != index && ID_SET(ports[j].kind) == set && ids[j] == id) {
             snprintf(why, why_len, "%s %u is %s's", what, (unsigned)id, ports[j].id_register);
             return true;
         }
@@ -345,8 +376,8 @@ static cyphal_reg_result_t write_port_id(const cyphal_register_t *r, cyphal_sett
     const cyphal_port_kind_t kind = ((const cyphal_port_t *)r->ctx)->kind;
     if (n < 0 || n > UINT32_MAX || !cyphal_port_id_valid(kind, (uint32_t)n)) {
         snprintf(why, why_len, "a %s-ID is 0 to %d, or 65535 to turn the port off",
-                 kind == CYPHAL_PORT_SRV ? "service" : "subject",
-                 kind == CYPHAL_PORT_SRV ? CYPHAL_SERVICE_ID_MAX : CYPHAL_SUBJECT_ID_MAX);
+                 HAS_SERVICE_ID(kind) ? "service" : "subject",
+                 HAS_SERVICE_ID(kind) ? CYPHAL_SERVICE_ID_MAX : CYPHAL_SUBJECT_ID_MAX);
         return CYPHAL_REG_BAD_VALUE;
     }
     if (!cyphal_port_id_free(s, port_index(r), (uint32_t)n, s_port_count, why, why_len)) {
@@ -410,7 +441,7 @@ static bool ports_ok(const cyphal_port_t *ports, size_t count, char *why, size_t
         const cyphal_port_t *p = &ports[i];
         if (!cyphal_port_id_valid(p->kind, p->default_id)) {
             snprintf(why, why_len, "port %s: the default %u is no %s-ID", p->name, p->default_id,
-                     p->kind == CYPHAL_PORT_SRV ? "service" : "subject");
+                     HAS_SERVICE_ID(p->kind) ? "service" : "subject");
             return false;
         }
         if (!register_name_ok(p->id_register) || !register_name_ok(p->type_register) || p->type == NULL) {

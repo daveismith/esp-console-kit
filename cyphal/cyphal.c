@@ -50,7 +50,8 @@
  * go_online() subscribes from it, a transfer finds its row through its subscription's user_reference,
  * and the port list is made from it, so the list can't disagree with what is subscribed. What it serves
  * and publishes is fixed for a run (the port registers apply from the next start), so that list is
- * serialized once a start, as GetInfo's response is.
+ * serialized once a start, as GetInfo's response is. With CONFIG_CYPHAL_CLIENT the rows also name the services the
+ * node calls, whose responses it subscribes to (the client, at the end of this file).
  *
  * Work that can wait (a register written to NVS, or read where reading may wait: CYPHAL_REG_READ_ON_WORKER, a
  * restart, a factory reset, identify) is handed to
@@ -135,6 +136,11 @@
 #include <stdio.h>
 #include "cyphal_alloc.h"
 #endif
+#if CONFIG_CYPHAL_CLIENT
+#include "cyphal_client.h"
+#include "uavcan/file/GetInfo_0_2.h"
+#include "uavcan/file/List_0_2.h"
+#endif
 
 static const char *TAG = "cyphal";
 
@@ -217,12 +223,59 @@ static const service_t SERVICES[] = {
 #define SERVICE_COUNT (sizeof(SERVICES) / sizeof(SERVICES[0]))
 /* Every row the node can have: its own, one for each of the application's ports, and its fixed services */
 #define ROW_MAX       (SERVICE_COUNT + CYPHAL_PORTS_MAX + CYPHAL_FIXED_SERVICES_MAX)
+
+#if CONFIG_CYPHAL_CLIENT
+static void on_response(node_t *n, const service_t *svc, const struct CanardRxTransfer *t, int64_t now);
+
+/* The standard services the client calls on the IDs the standard fixes (CYPHAL_CALL_FIXED()), with their responses'
+ * extents: rows past s_rows[] (row(); const, where s_rows[] is internal RAM), each subscribed to, into node_t.subs[] at
+ * its row's index, and listed among port.List's clients from its first call in a run (client_subscribe()); kept from
+ * the application's called ports by the register rule (cyphal_reg_called()) */
+static const service_t FIXED_CLIENTS[] = {
+    { CYPHAL_PORT_CLI, uavcan_node_GetInfo_1_0_FIXED_PORT_ID_, -1, uavcan_node_GetInfo_Response_1_0_EXTENT_BYTES_,
+      on_response, NULL, NULL },
+    { CYPHAL_PORT_CLI, uavcan_node_ExecuteCommand_1_3_FIXED_PORT_ID_, -1,
+      uavcan_node_ExecuteCommand_Response_1_3_EXTENT_BYTES_, on_response, NULL, NULL },
+    { CYPHAL_PORT_CLI, uavcan_register_Access_1_0_FIXED_PORT_ID_, -1, uavcan_register_Access_Response_1_0_EXTENT_BYTES_,
+      on_response, NULL, NULL },
+    { CYPHAL_PORT_CLI, uavcan_register_List_1_0_FIXED_PORT_ID_, -1, uavcan_register_List_Response_1_0_EXTENT_BYTES_,
+      on_response, NULL, NULL },
+    { CYPHAL_PORT_CLI, uavcan_file_GetInfo_0_2_FIXED_PORT_ID_, -1, uavcan_file_GetInfo_Response_0_2_EXTENT_BYTES_,
+      on_response, NULL, NULL },
+    { CYPHAL_PORT_CLI, uavcan_file_List_0_2_FIXED_PORT_ID_, -1, uavcan_file_List_Response_0_2_EXTENT_BYTES_,
+      on_response, NULL, NULL },
+};
+#define FIXED_CLIENT_COUNT (sizeof(FIXED_CLIENTS) / sizeof(FIXED_CLIENTS[0]))
+_Static_assert(FIXED_CLIENT_COUNT == CYPHAL_CALL_FIXED_COUNT, "cyphal_client.h names them all");
+/* The transfers a row's subscription takes: requests to a service it serves, responses from one it calls, messages;
+ * and what serves an application's row of each kind (none for a subject it publishes) */
+#define RX_KIND(kind) ((kind) == CYPHAL_PORT_SRV   ? CanardTransferKindRequest  \
+                       : (kind) == CYPHAL_PORT_CLI ? CanardTransferKindResponse \
+                                                   : CanardTransferKindMessage)
+#define SERVE_FOR(kind) ((kind) == CYPHAL_PORT_SRV   ? on_app_request \
+                         : (kind) == CYPHAL_PORT_SUB ? on_app_message \
+                         : (kind) == CYPHAL_PORT_CLI ? on_response    \
+                                                     : NULL)
+#else
+#define FIXED_CLIENT_COUNT 0
+#define RX_KIND(kind) ((kind) == CYPHAL_PORT_SRV ? CanardTransferKindRequest : CanardTransferKindMessage)
+#define SERVE_FOR(kind) ((kind) == CYPHAL_PORT_SRV ? on_app_request : (kind) == CYPHAL_PORT_SUB ? on_app_message : NULL)
+#endif
 _Static_assert(ROW_MAX <= uavcan_node_port_SubjectIDList_1_0_sparse_list_ARRAY_CAPACITY_,
                "the port list holds every subject the node can have");
 
 /* SERVICES[], then the application's ports with handlers (cyphal_init()): fixed from then on */
 static service_t s_rows[ROW_MAX];
 static size_t s_row_count;
+
+#if CONFIG_CYPHAL_CLIENT
+/* Every row: s_rows[], then FIXED_CLIENTS[] past them. row(i) for i below ROW_TOTAL */
+#define ROW_TOTAL (s_row_count + FIXED_CLIENT_COUNT)
+static inline const service_t *row(size_t i)
+{
+    return i < s_row_count ? &s_rows[i] : &FIXED_CLIENTS[i - s_row_count];
+}
+#endif
 
 /* Plug-and-play's, while waiting only: not a port the node has online, so not in s_rows[] or the list */
 static const service_t ALLOCATION = { CYPHAL_PORT_SUB, uavcan_pnp_NodeIDAllocationData_1_0_FIXED_PORT_ID_, -1,
@@ -255,9 +308,10 @@ static uint32_t s_mail_ready;               /* READY buffers in every mailbox, t
 struct node {
     struct CanardInstance canard;
     struct CanardTxQueue txq;
-    /* s_rows[]' subscriptions while online, and NodeIDAllocationData's while waiting, each with its row
-     * as user_reference. They must not move while subscribed: s_node is never freed */
-    struct CanardRxSubscription subs[ROW_MAX];
+    /* s_rows[]' subscriptions while online, from the first; with the client, past them, a fixed client's at its row's
+     * index (row()), from its first call; and NodeIDAllocationData's while waiting, each with its row as
+     * user_reference (NULL for none). They must not move while subscribed: s_node is never freed */
+    struct CanardRxSubscription subs[ROW_MAX + FIXED_CLIENT_COUNT];
     struct CanardRxSubscription allocation;
     uint32_t run;                           /* this start's number (s_runs), which its jobs carry */
     uint8_t getinfo_response[uavcan_node_GetInfo_Response_1_0_SERIALIZATION_BUFFER_SIZE_BYTES_];
@@ -318,6 +372,9 @@ enum { JOB_FREE, JOB_FILLING, JOB_WORK, JOB_DONE };
  * work_command()) builds its response on its own stack, so the two never write the same memory */
 typedef union {
     uavcan_register_Access_Response_1_0 access;
+#if CONFIG_CYPHAL_CLIENT
+    uint8_t response[CYPHAL_CALL_RESPONSE_MAX];     /* a call's response, copied out for its callback (client_worker()) */
+#endif
 } worker_scratch_t;
 
 static SemaphoreHandle_t s_lock;        /* settings, start, stop and status against each other */
@@ -377,6 +434,35 @@ static esp_err_t alloc_port_lists(node_t *n);
 static const uint8_t *alloc_port_list(const node_t *n, size_t *size);
 static bool alloc_is_register(const cyphal_register_t *r);
 static bool s_alloc_port_listed;    /* serialize_port_list() adds the allocator's subject (alloc_port_lists()) */
+#endif
+
+/* The client (cyphal_client.h): its code is at the end of this file; these are where the node calls it, and without
+ * it they are nothing */
+#if CONFIG_CYPHAL_CLIENT
+static bool fixed_client(uint16_t id);
+static void client_init(void);
+static void client_start(void);
+static bool client_send(node_t *n, int64_t now);
+static bool client_waiting(void);
+static void client_expire(int64_t now);
+static int64_t client_next_deadline(void);
+static void client_fail_all(void);
+static void client_worker(void);
+/* The calls: their records and transfer-IDs in PSRAM (client_init()), the pool and their states here, for the
+ * atomics */
+static cyphal_call_pool_t s_calls;
+static uint32_t s_call_states[CONFIG_CYPHAL_CLIENT_CALLS];
+#else
+/* Macros, not empty inline functions: a call that returns false is folded later than a literal, and the node task's
+ * code came out different */
+#define client_init()
+#define client_start()
+#define client_send(n, now)    false
+#define client_waiting()       false
+#define client_expire(now)
+#define client_next_deadline() INT64_MAX
+#define client_fail_all()
+#define client_worker()
 #endif
 
 static void lock(void)
@@ -487,7 +573,8 @@ static void load(cyphal_settings_t *s)
 }
 
 /* The ports fixed by the standard, for the port registers' rule (cyphal_reg_fixed()): SERVICES[]' rows,
- * plug-and-play's, and the application's fixed services that can be kept (s_app_fixed[]) */
+ * plug-and-play's, and the application's fixed services that can be kept (s_app_fixed[]). The services the client
+ * calls are FIXED_CLIENTS[]' (cyphal_reg_called()) */
 static cyphal_fixed_port_t s_fixed[SERVICE_COUNT + 1 + CYPHAL_FIXED_SERVICES_MAX];
 static const cyphal_handler_t *s_app_fixed[CYPHAL_FIXED_SERVICES_MAX];
 static size_t s_app_fixed_count;
@@ -532,6 +619,9 @@ static void fix_ports(void)
         s_fixed[n++] = (cyphal_fixed_port_t){ CYPHAL_PORT_SRV, h->fixed_id };
     }
     cyphal_reg_fixed(s_fixed, n);
+#if CONFIG_CYPHAL_CLIENT
+    cyphal_reg_called(fixed_client);
+#endif
 }
 
 /* New saved settings, under s_lock: in NVS first, then in use from the next start */
@@ -733,6 +823,11 @@ static const char *handler_fault(const cyphal_handler_t *h, const bool taken[CYP
                : h->extent == 0 ? "no extent" : NULL;
     case CYPHAL_PORT_SUB:
         return h->on_message == NULL ? "a subscription needs on_message" : h->extent == 0 ? "no extent" : NULL;
+#if CONFIG_CYPHAL_CLIENT
+    case CYPHAL_PORT_CLI:   /* its extent, the response's */
+        return h->extent == 0 ? "no extent" : h->extent > CYPHAL_CALL_RESPONSE_MAX ? "its extent is over "
+                                                                                     "CYPHAL_CALL_RESPONSE_MAX" : NULL;
+#endif
     default:
         return h->publish_max == 0 || h->publish_max > CYPHAL_PUBLISH_MAX ? "publish_max is 1 to CYPHAL_PUBLISH_MAX"
                : h->publish_depth > CYPHAL_PUBLISH_DEPTH_MAX ? "publish_depth is over CYPHAL_PUBLISH_DEPTH_MAX"
@@ -786,7 +881,7 @@ static void make_rows(void)
             .kind = p->kind,
             .app_port = (int8_t)h->port,
             .extent = h->extent,
-            .serve = p->kind == CYPHAL_PORT_SRV ? on_app_request : p->kind == CYPHAL_PORT_SUB ? on_app_message : NULL,
+            .serve = SERVE_FOR(p->kind),
             .work = p->kind == CYPHAL_PORT_SRV ? work_app : NULL,
             .app = h,
         };
@@ -830,6 +925,7 @@ esp_err_t cyphal_init(const cyphal_app_t *app)
 #if CONFIG_CYPHAL_PNP_ALLOCATOR
     alloc_load();
 #endif
+    client_init();
     /* The factory MAC, burnt into eFuse: the same after a reflash or a settings wipe */
     uint8_t mac[6] = { 0 };
     esp_err_t err = esp_efuse_mac_get_default(mac);
@@ -948,8 +1044,12 @@ static uint16_t port_of(const service_t *svc)
     return svc->app_port < 0 ? svc->port_id : s_run.port_id[svc->app_port];
 }
 
+/* A service-ID set in a port list's mask of them (its clients or its servers) */
+#define LIST_SERVICE(mask, port) ((mask)[(port) / 8] |= (uint8_t)(1u << ((port) % 8)))
+
 /* uavcan.node.port.List's message, serialized: s_rows[], the ports the node has while online, fixed
- * for the run. The serializer wants room for the type's largest (8.5 KB, its subject lists' extents),
+ * for the run (but for a standard service the client calls, added at its first call: client_subscribe()).
+ * The serializer wants room for the type's largest (8.5 KB, its subject lists' extents),
  * so it and the struct (2 KB) are on the heap for the moment, not on the starting task's stack */
 static esp_err_t serialize_port_list(node_t *n)
 {
@@ -961,19 +1061,31 @@ static esp_err_t serialize_port_list(node_t *n)
     uint8_t *buf = (uint8_t *)(m + 1);
     uavcan_node_port_SubjectIDList_1_0_select_sparse_list_(&m->publishers);
     uavcan_node_port_SubjectIDList_1_0_select_sparse_list_(&m->subscribers);
-    for (size_t i = 0; i < s_row_count; i++) {          /* clients: none */
+    for (size_t i = 0; i < s_row_count; i++) {          /* clients: none, without CONFIG_CYPHAL_CLIENT */
         const uint16_t port = port_of(&s_rows[i]);
         if (port == CYPHAL_PORT_OFF) {
             continue;
         }
+#if CONFIG_CYPHAL_CLIENT
+        if (s_rows[i].kind == CYPHAL_PORT_CLI) {       /* subscribed to while online: go_online() */
+            LIST_SERVICE(m->clients.mask_bitpacked_, port);
+            continue;
+        }
+#endif
         if (s_rows[i].kind == CYPHAL_PORT_SRV) {
-            m->servers.mask_bitpacked_[port / 8] |= (uint8_t)(1u << (port % 8));
+            LIST_SERVICE(m->servers.mask_bitpacked_, port);
         } else {
             uavcan_node_port_SubjectIDList_1_0 *list = s_rows[i].kind == CYPHAL_PORT_PUB ? &m->publishers
                                                                                         : &m->subscribers;
             list->sparse_list.elements[list->sparse_list.count++].value = port;
         }
     }
+#if CONFIG_CYPHAL_CLIENT
+    if (s_app.on_heartbeat != NULL) {   /* heard from the frame (on_frame()), not through libcanard, but heard */
+        m->subscribers.sparse_list.elements[m->subscribers.sparse_list.count++].value =
+            uavcan_node_Heartbeat_1_0_FIXED_PORT_ID_;
+    }
+#endif
 #if CONFIG_CYPHAL_PNP_ALLOCATOR
     if (s_alloc_port_listed) {      /* the allocator answers this run: it subscribes to 8166 and publishes on it */
         m->publishers.sparse_list.elements[m->publishers.sparse_list.count++].value =
@@ -1101,6 +1213,13 @@ static void port_list(node_t *n, int64_t now)
     s_services.port_lists++;
 }
 
+/* A row's transfers on `port` subscribed to, into sub, the row its user_reference: on_frame()'s way back to it.
+ * go_online()'s, and the client's for a standard service (client_subscribe()) */
+#define SUBSCRIBE(n, sub, svc, port)                                                                                \
+    (canardRxSubscribe(&(n)->canard, RX_KIND((svc)->kind), (port), (svc)->extent,                                   \
+                       CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC, (sub)),                                            \
+     (void)((sub)->user_reference = (void *)(svc)))
+
 /* The heartbeat, the port list and the services on n->node_id, from now: after the listen, or an
  * allocation */
 static void go_online(node_t *n, int64_t now)
@@ -1113,9 +1232,7 @@ static void go_online(node_t *n, int64_t now)
         if (svc->serve == NULL || port == CYPHAL_PORT_OFF) {
             continue;
         }
-        canardRxSubscribe(&n->canard, svc->kind == CYPHAL_PORT_SRV ? CanardTransferKindRequest : CanardTransferKindMessage,
-                          port, svc->extent, CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC, sub);
-        sub->user_reference = (void *)svc;      /* on_frame()'s way back to the row */
+        SUBSCRIBE(n, sub, svc, port);
         sub++;
     }
 #if CONFIG_CYPHAL_PNP_ALLOCATOR
@@ -1139,6 +1256,7 @@ static void stop_in_use(node_t *n)
 #if CONFIG_CYPHAL_PNP_ALLOCATOR
     alloc_in_use();
 #endif
+    client_fail_all();  /* nothing more goes as this node-ID, and no answer can come */
     s_tr_dropped += clear_tx(n);
     n->canard.node_id = CANARD_NODE_ID_UNSET;
     ESP_LOGW(TAG, "node-ID %u is in use by another node; Cyphal stopped", n->node_id);
@@ -1296,6 +1414,11 @@ static void unready_locked(mailbox_t *m)
     __atomic_sub_fetch(&s_mail_ready, 1, __ATOMIC_RELAXED);
 }
 
+/* Whether a transfer of `frames` waits for a later turn: the transmit queue hasn't room for all of it, but would have
+ * (one bigger than the whole queue never would, so it goes, for libcanard to refuse and count). The mailboxes' rule,
+ * and the client's */
+#define WAITS_FOR_ROOM(frames, room, capacity) ((frames) > (room) && (frames) <= (capacity))
+
 /* The mailboxes' messages into the transmit queue, oldest first, each at its port's priority with the port's next
  * transfer-ID, straight from its buffer (push() copies it), which is then freed. Only online, on a port that isn't
  * off this run (cyphal_publish() takes nothing otherwise, but a message can be committed just before the node
@@ -1319,10 +1442,9 @@ static bool collect_mail(node_t *n, int64_t now)
                     b = k;
                 }
             }
-            /* Not unless the queue has room for all of it: it waits for a later turn instead (one bigger than the
-             * whole queue never would, so it goes, for libcanard to refuse and count) */
+            /* Not unless the queue has room for all of it: it waits for a later turn instead */
             const size_t frames = b < 0 ? 0 : cyphal_frames(m->size[b]);
-            if (b >= 0 && frames > room && frames <= n->txq.capacity) {
+            if (b >= 0 && WAITS_FOR_ROOM(frames, room, n->txq.capacity)) {
                 b = -1;
                 held = true;
             }
@@ -1366,7 +1488,8 @@ static bool mail_waiting(void)
 /* The worker's finished jobs, their responses into the transmit queue (sent by flush(), after the
  * receive queue has been read like everything else), and their slots freed. A job from an earlier start,
  * or one done after the node stopped over its node-ID, is dropped; a response that didn't serialize is
- * counted as dropped. Then the mailboxes: true if one held a message back (collect_mail()) */
+ * counted as dropped. Then the client's calls queued (client_send(), with CONFIG_CYPHAL_CLIENT) and the mailboxes:
+ * true if one held a request or a message back for room (collect_mail()) */
 static bool collect(node_t *n)
 {
     for (int i = 0; i < JOB_SLOTS; i++) {
@@ -1383,7 +1506,9 @@ static bool collect(node_t *n)
         }
         job_set(job, JOB_FREE);
     }
-    return collect_mail(n, esp_timer_get_time());
+    const int64_t now = esp_timer_get_time();
+    const bool calls_held = client_send(n, now);   /* the calls queued: the same room rule as mail */
+    return collect_mail(n, now) || calls_held;
 }
 
 /* Whether the worker has finished a job collect() hasn't taken yet */
@@ -1767,6 +1892,7 @@ static void worker_task(void *arg)
 #if CONFIG_CYPHAL_PNP_ALLOCATOR
         alloc_worker();     /* a row the node's task added (it wakes the worker for it) */
 #endif
+        client_worker();    /* the calls ended, their callbacks (the node's task wakes the worker for them) */
         if (s_app.poll != NULL && ((got && job == NULL) || esp_timer_get_time() >= next_poll_us)) {
             const uint32_t ms = s_app.poll(s_state == CYPHAL_ONLINE);
             next_poll_us = esp_timer_get_time() + (int64_t)ms * 1000;
@@ -1795,6 +1921,16 @@ static void on_frame(node_t *n, const canbus_frame_t *f)
         stop_in_use(n);
         return;
     }
+#if CONFIG_CYPHAL_CLIENT
+    if (state == CYPHAL_ONLINE && s_app.on_heartbeat != NULL) {
+        uint8_t from;
+        cyphal_heartbeat_t hb;
+        if (cyphal_heartbeat_frame(f->id, f->ext, f->rtr, f->data, f->len, &from, &hb)) {
+            s_app.on_heartbeat(from, &hb);
+            return;     /* nothing subscribes to heartbeats: libcanard would drop it */
+        }
+    }
+#endif
     if ((state != CYPHAL_ONLINE && state != CYPHAL_WAITING) || !f->ext || f->rtr) {
         return;
     }
@@ -1976,6 +2112,7 @@ static void timers(node_t *n, int64_t now)
         n->next_bus_check_us = now + BUS_CHECK_US;
         check_bus(n, now);
     }
+    client_expire(now);
 }
 
 /* Ticks to the next timer, rounded up: a second at most, the bus check's period */
@@ -1994,6 +2131,10 @@ static TickType_t ticks_to_next(const node_t *n, int64_t now)
     }
     if (s_state == CYPHAL_ONLINE && n->next_port_list_us < next) {
         next = n->next_port_list_us;
+    }
+    const int64_t call = client_next_deadline();   /* a call to time out */
+    if (call < next) {
+        next = call;
     }
     const int64_t tick_us = 1000000 / configTICK_RATE_HZ;
     return next <= now ? 0 : (TickType_t)((next - now + tick_us - 1) / tick_us);
@@ -2019,8 +2160,9 @@ static void node_task(void *arg)
          * A message collect() held back for room is no new mail: with the queue still full it waits as the queue
          * does, a tick when flush() asks for one (bus-off: canbus refuses at once, and a wait of 0 here would spin
          * this task, the highest on its core, until frames expire); once flush() has emptied the queue, round the
-         * loop at once to queue it. A message that came in meanwhile waits a tick at most: the queue isn't empty */
-        const bool mail = held ? sent : mail_waiting();
+         * loop at once to queue it. A message that came in meanwhile waits a tick at most: the queue isn't empty.
+         * A call queued is mail in all this (client_send()) */
+        const bool mail = held ? sent : mail_waiting() || client_waiting();
         const TickType_t wait = jobs_done() || mail ? 0 : !sent ? (retry ? 1 : 0)
                                                                : ticks_to_next(n, esp_timer_get_time());
         /* Asleep until the next timer or frame, or a canbus_wake(): the worker's, or a stop's. Looked at
@@ -2050,6 +2192,7 @@ static esp_err_t start_locked(int tx, int rx)
     s_run = s_saved;
     s_tr_sent = s_tr_received = s_tr_dropped = s_frames_queued = s_heap_failed = s_txq_peak = 0;
     s_services = (cyphal_services_t){ 0 };
+    client_start();
     for (size_t i = 0; i < s_mail_count; i++) {
         /* What waits from the last run is dropped; a buffer a publisher is filling is its to commit */
         mailbox_t *m = &s_mail[i];
@@ -2175,6 +2318,7 @@ static esp_err_t stop_locked(void)
         s_error = err;
         s_stop_failed = true;
     }
+    client_fail_all();  /* the task has ended, the state is no longer online */
     return err;
 }
 
@@ -3028,3 +3172,363 @@ static void on_alloc_request(node_t *n, const service_t *svc, const struct Canar
     push(n, &meta, buf, size, now);
 }
 #endif /* CONFIG_CYPHAL_PNP_ALLOCATOR */
+
+#if CONFIG_CYPHAL_CLIENT
+/* ------------------------------------------------------------------ the client
+ *
+ * cyphal_client.h says what it does and how a call's record moves from state to state; the node calls it from the
+ * places the prototypes near the top name. The records are shared three ways, each state change by one party, a
+ * compare-and-swap, checking the record's generation, where the caller and the node's task can race over a queued
+ * call: the caller fills and queues a record (cyphal_call(), any task) and wakes the node's task; the node's task
+ * sends the oldest first at its turn (collect(), after the receive queue has been read, the same room rule as a
+ * mailbox's message), matches the response to it (on_response(), from a row's subscription to responses), times it
+ * out (timers()) or fails it (the node's node-ID in use) and wakes the worker; the worker takes its outcome, frees it
+ * and runs its callback, oldest first (worker_task()). A stop fails every call out once the task has ended. Only the
+ * node's task touches libcanard: the request is copied in at the call and queued from the record, and the response
+ * copied out of libcanard's buffer, which on_frame() frees as for every transfer.
+ *
+ * What the client calls is a row (row()): an application's CYPHAL_PORT_CLI port with a handler, one of s_rows[]
+ * subscribed with the others by go_online(), or a standard service of FIXED_CLIENTS[], a row past them subscribed at
+ * its first call in a run (client_subscribe()). A call's record keeps its row; its transfer-IDs are those of its
+ * place among the rows that can be called (tid_row()).
+ */
+
+_Static_assert(FIXED_CLIENT_COUNT <= 32, "s_fixed_called has a bit for each");
+_Static_assert(CONFIG_CYPHAL_CLIENT_CALLS <= CANARD_TRANSFER_ID_MAX + 1, "a free transfer-ID for every call out");
+
+/* FIXED_CLIENTS[] subscribed to this run, a bit each (FIXED_CLIENTS[i] is bit i): set by the node's task at a
+ * service's first call (client_subscribe()), cleared by a start before the task exists; read by
+ * cyphal_client_status() from any task, which never looks at libcanard's subscriptions. Through __atomic only */
+static uint32_t s_fixed_called;
+
+/* push() with the transfer's deadline at `deadline` rather than TX_DEADLINE_US from now: push() adds TX_DEADLINE_US to
+ * the time it is given and uses it for nothing else */
+#define push_by(n, meta, data, size, deadline) push((n), (meta), (data), (size), (deadline) - TX_DEADLINE_US)
+
+/* cyphal_reg_called()'s: whether a service-ID is one the client calls on its fixed ID */
+static bool fixed_client(uint16_t id)
+{
+    for (size_t i = 0; i < FIXED_CLIENT_COUNT; i++) {
+        if (FIXED_CLIENTS[i].port_id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* cyphal_call()'s port as the index of its row: an application's CYPHAL_PORT_CLI port with a handler, or a standard
+ * service by CYPHAL_CALL_FIXED(); -1 for neither */
+static int client_row(size_t port)
+{
+    for (size_t i = 0; i < ROW_TOTAL; i++) {
+        const service_t *svc = row(i);
+        const size_t called = svc->app_port >= 0 ? (size_t)svc->app_port : CYPHAL_CALL_FIXED(svc->port_id);
+        if (svc->kind == CYPHAL_PORT_CLI && called == port) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* A row's place among those that can be called, the application's CYPHAL_PORT_CLI rows in order and then
+ * FIXED_CLIENTS[]: its row of transfer-IDs. tid_row(ROW_TOTAL) is how many there are */
+static size_t tid_row(size_t r)
+{
+    size_t k = r > s_row_count ? r - s_row_count : 0;
+    for (size_t i = 0; i < r && i < s_row_count; i++) {
+        k += s_rows[i].kind == CYPHAL_PORT_CLI;
+    }
+    return k;
+}
+
+/* cyphal_init(), after make_rows(): the records and the transfer-IDs, in PSRAM where there is some, kept */
+static void client_init(void)
+{
+    const size_t rows = tid_row(ROW_TOTAL);
+    cyphal_call_t *calls = psram_calloc(CONFIG_CYPHAL_CLIENT_CALLS * sizeof(cyphal_call_t));
+    uint8_t *tids = psram_calloc(rows * CYPHAL_CALL_SERVERS);
+    if (calls == NULL || tids == NULL) {
+        ESP_LOGE(TAG, "client: no memory for its calls: it calls nothing");
+        heap_caps_free(calls);
+        heap_caps_free(tids);
+        calls = NULL;
+        tids = NULL;
+    }
+    cyphal_call_pool_init(&s_calls, calls, s_call_states, CONFIG_CYPHAL_CLIENT_CALLS, tids, rows);
+}
+
+/* start_locked(), before the task exists: no standard service called yet this run (make_node() clears their
+ * subscriptions). The counts go on from boot: a stop's failed calls, whose callbacks the worker may run after this,
+ * stay counted beside the calls they were */
+static void client_start(void)
+{
+    __atomic_store_n(&s_fixed_called, 0, __ATOMIC_RELAXED);
+}
+
+/* A standard service's first call in this run (row r, one of FIXED_CLIENTS[]): its responses subscribed to, into
+ * n->subs[r], past the rows go_online() subscribed, and its ID added to the port list's clients, in each list the run
+ * has; the list is sent at the next turn, its ports having changed */
+static void client_subscribe(node_t *n, size_t r, int64_t now)
+{
+    const service_t *svc = row(r);
+    SUBSCRIBE(n, &n->subs[r], svc, svc->port_id);
+    __atomic_or_fetch(&s_fixed_called, 1u << (r - s_row_count), __ATOMIC_RELAXED);
+    bool listed = cyphal_port_list_add_client(n->port_list, n->port_list_size, svc->port_id);
+#if CONFIG_CYPHAL_PNP_ALLOCATOR
+    if (s_alloc_plain_list_size != 0) {     /* the list without the allocator's subject, for once it stops */
+        listed &= cyphal_port_list_add_client(s_alloc_plain_list, s_alloc_plain_list_size, svc->port_id);
+    }
+#endif
+    if (!listed) {
+        ESP_LOGW(TAG, "client: service %u not added to the port list", (unsigned)svc->port_id);
+    }
+    n->next_port_list_us = now;
+}
+
+/* collect(), every turn: the calls queued sent, oldest first, each request at its port's priority (nominal for a
+ * standard service) with the next transfer-ID of its port and server free of the calls out, straight from its record
+ * (push() copies it), its transfer's deadline the call's (TX_DEADLINE_US at most). A record's fields are read only
+ * once cyphal_call_begin() has it: before, its caller may take it back and another call fill it. Only online, on a
+ * port that isn't off this run: otherwise it fails (queued as the node stopped: client_fail_all(); or from a run whose
+ * port was on). A request the transmit queue hasn't room for, whole, waits for a later turn, as a mailbox's message
+ * does, and the younger calls wait behind it (the order cyphal_call() promises): true if one did. One libcanard
+ * refuses (its heap full) is not sent */
+static bool client_send(node_t *n, int64_t now)
+{
+    if (!cyphal_call_waiting(&s_calls)) {
+        return false;
+    }
+    if (s_state != CYPHAL_ONLINE) {
+        client_fail_all();
+        return false;
+    }
+    bool held = false, ended = false;
+    while (!held) {
+        uint32_t ticket;
+        const int i = cyphal_call_next_queued(&s_calls, &ticket);
+        if (i < 0) {
+            break;
+        }
+        if (!cyphal_call_begin(&s_calls, (size_t)i, ticket)) {
+            continue;       /* its caller took it back */
+        }
+        const cyphal_call_t *c = &s_calls.calls[i];
+        const service_t *svc = row(c->port);
+        const uint16_t id = port_of(svc);
+        if (id == CYPHAL_PORT_OFF) {
+            cyphal_call_finish(&s_calls, (size_t)i, CYPHAL_CALL_FAILED);
+            ended = true;
+            continue;
+        }
+        if (WAITS_FOR_ROOM(cyphal_frames(c->request_size), n->txq.capacity - n->txq.size, n->txq.capacity)) {
+            cyphal_call_hold(&s_calls, (size_t)i);     /* queued again, the oldest still */
+            held = true;
+            continue;
+        }
+        if (c->port >= s_row_count && n->subs[c->port].user_reference == NULL) {
+            client_subscribe(n, c->port, now);
+        }
+        const uint8_t tid = cyphal_call_next_tid(&s_calls, tid_row(c->port), c->server, id);
+        const struct CanardTransferMetadata meta = {
+            .priority = svc->app_port < 0 ? CanardPriorityNominal
+                                          : (enum CanardPriority)cyphal_port((size_t)svc->app_port)->priority,
+            .transfer_kind = CanardTransferKindRequest,
+            .port_id = id,
+            .remote_node_id = c->server,
+            .transfer_id = tid,
+        };
+        if (push_by(n, &meta, c->request, c->request_size,
+                    cyphal_call_tx_deadline(&s_calls, (size_t)i, now, TX_DEADLINE_US))) {
+            cyphal_call_sent(&s_calls, (size_t)i, id, tid);
+        } else {
+            cyphal_call_finish(&s_calls, (size_t)i, CYPHAL_CALL_NOT_SENT);     /* push() counted it as dropped */
+            ended = true;
+        }
+    }
+    if (ended) {
+        cyphal_wake_worker();
+    }
+    return held;
+}
+
+/* node_task(): whether a call is queued, which counts as mail */
+static bool client_waiting(void)
+{
+    return cyphal_call_waiting(&s_calls);
+}
+
+/* A response on a row the client calls: the call it answers ended, for the worker; one that answers none (late, another
+ * node's, a transfer-ID nobody waits for) dropped, counted */
+static void on_response(node_t *n, const service_t *svc, const struct CanardRxTransfer *t, int64_t now)
+{
+    (void)n;
+    (void)svc;
+    (void)now;
+    if (cyphal_call_match(&s_calls, t->metadata.port_id, (uint8_t)t->metadata.remote_node_id, t->metadata.transfer_id,
+                          t->payload.data, t->payload.size) >= 0) {
+        cyphal_wake_worker();
+    }
+}
+
+/* timers(): the calls whose time is up, queued or sent, ended for the worker */
+static void client_expire(int64_t now)
+{
+    if (cyphal_call_expire(&s_calls, now) > 0) {
+        cyphal_wake_worker();
+    }
+}
+
+/* ticks_to_next(): the next call to time out */
+static int64_t client_next_deadline(void)
+{
+    return cyphal_call_next_deadline(&s_calls);
+}
+
+/* Every call out failed, for the worker, wherever the node leaves ONLINE (after the state has): stop_in_use() on the
+ * node's task, stop_locked() with it ended, and client_send() for a call queued meanwhile. A caller that queued
+ * meanwhile sees the state and takes its call back (cyphal_call_queue()'s fence and cyphal_call_fail_all()'s) */
+static void client_fail_all(void)
+{
+    if (cyphal_call_fail_all(&s_calls) > 0) {
+        cyphal_wake_worker();
+    }
+}
+
+/* worker_task(), every turn: each call ended, oldest first, its outcome and response taken (into the worker's scratch,
+ * which only work_access() also uses, between turns), its record freed, then its callback run: so a callback can make
+ * a call on the record its own call had, even with every other one in use */
+static void client_worker(void)
+{
+    static const esp_err_t ERR[] = {
+        [CYPHAL_CALL_ANSWERED] = ESP_OK,
+        [CYPHAL_CALL_TIMED_OUT] = ESP_ERR_TIMEOUT,
+        [CYPHAL_CALL_NOT_SENT] = ESP_ERR_NO_MEM,
+        [CYPHAL_CALL_FAILED] = ESP_ERR_INVALID_STATE,
+    };
+    for (int i = cyphal_call_done(&s_calls); i >= 0; i = cyphal_call_done(&s_calls)) {
+        const cyphal_call_t *c = &s_calls.calls[i];
+        const cyphal_response_cb_t cb = c->cb;
+        void *const ctx = c->ctx;
+        const bool answered = c->outcome == CYPHAL_CALL_ANSWERED;
+        const esp_err_t err = ERR[c->outcome];
+        const size_t size = answered && cb != NULL ? c->response_size : 0;
+        memcpy(s_ws->response, c->response, size);
+        cyphal_call_free(&s_calls, (size_t)i);
+        if (cb != NULL) {
+            cb(err, answered ? s_ws->response : NULL, size, ctx);
+        }
+    }
+}
+
+esp_err_t cyphal_call(size_t port, uint8_t server, const void *request, size_t size, uint32_t timeout_ms,
+                      cyphal_response_cb_t cb, void *ctx)
+{
+    const int r = client_row(port);
+    if (r < 0 || port_of(row((size_t)r)) == CYPHAL_PORT_OFF) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (server > CYPHAL_NODE_ID_MAX || timeout_ms == 0 || (size > 0 && request == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (size > CYPHAL_CALL_REQUEST_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (s_state != CYPHAL_ONLINE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (server == s_node->node_id) {    /* its own frames never come back to it */
+        return ESP_ERR_INVALID_ARG;
+    }
+    const int i = cyphal_call_take(&s_calls);
+    if (i < 0) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    cyphal_call_t *c = &s_calls.calls[i];
+    c->port = (size_t)r;
+    c->server = server;
+    c->deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    c->cb = cb;
+    c->ctx = ctx;
+    c->request_size = size;
+    if (size > 0) {
+        memcpy(c->request, request, size);
+    }
+    const uint32_t ticket = cyphal_call_queue(&s_calls, (size_t)i);
+    /* Not online any more (a stop, the node-ID in use): taken back, unless the node's task or a stop already has it,
+     * which then ends it, failed, with its callback (which may have run, and the record gone to another call, which
+     * the ticket leaves alone) */
+    if (s_state != CYPHAL_ONLINE && cyphal_call_cancel(&s_calls, (size_t)i, ticket)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    canbus_wake(__atomic_load_n(&s_bus, __ATOMIC_RELAXED));     /* refused if the node has stopped: nobody waits */
+    return ESP_OK;
+}
+
+/* cyphal_call_wait()'s: the caller waiting, and where the response goes */
+typedef struct {
+    StaticSemaphore_t sem_buf;
+    SemaphoreHandle_t done;
+    uint8_t *resp;
+    size_t room;            /* resp's size: 0 for no response wanted */
+    size_t size;            /* copied */
+    esp_err_t err;
+} call_wait_t;
+
+static void call_wait_cb(int err, const uint8_t *payload, size_t size, void *ctx)
+{
+    call_wait_t *w = ctx;
+    w->err = err;
+    if (err == ESP_OK && w->resp != NULL) {
+        w->size = size < w->room ? size : w->room;
+        memcpy(w->resp, payload, w->size);
+        if (size > w->room) {
+            w->err = ESP_ERR_INVALID_SIZE;
+        }
+    }
+    xSemaphoreGive(w->done);    /* the last touch of *w: the caller returns, and its stack holds it no longer */
+}
+
+esp_err_t cyphal_call_wait(size_t port, uint8_t server, const void *request, size_t size, void *resp,
+                           size_t *resp_size, uint32_t timeout_ms)
+{
+    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    call_wait_t w = { .resp = resp_size != NULL ? resp : NULL,
+                      .room = resp != NULL && resp_size != NULL ? *resp_size : 0 };
+    /* The node's task sends and receives the call, the worker runs its callback, and the worker takes s_lock (the
+     * allocator's rows, a register written over Cyphal): a register's write hook holds it for `cyphal register` */
+    esp_err_t err = me == s_task || me == s_worker || (s_lock != NULL && xSemaphoreGetMutexHolder(s_lock) == me)
+                        ? ESP_ERR_NOT_ALLOWED : ESP_OK;
+    if (err == ESP_OK) {
+        w.done = xSemaphoreCreateBinaryStatic(&w.sem_buf);
+        err = cyphal_call(port, server, request, size, timeout_ms, call_wait_cb, &w);
+    }
+    if (err != ESP_OK) {
+        if (resp_size != NULL) {
+            *resp_size = 0;
+        }
+        return err;
+    }
+    /* For ever: every call cyphal_call() takes ends in exactly one callback (answered, timed out at its deadline,
+     * failed by a stop), which gives this */
+    xSemaphoreTake(w.done, portMAX_DELAY);
+    if (resp_size != NULL) {
+        *resp_size = w.size;
+    }
+    return w.err;
+}
+
+void cyphal_client_status(cyphal_client_status_t *out)
+{
+    *out = (cyphal_client_status_t){
+        .counts = s_calls.counts,
+        .held = cyphal_call_held(&s_calls),
+        .slots = s_calls.count,
+    };
+    const uint32_t called = __atomic_load_n(&s_fixed_called, __ATOMIC_RELAXED);
+    for (size_t i = 0; i < FIXED_CLIENT_COUNT; i++) {
+        if (called & (1u << i)) {
+            out->fixed[out->fixed_count++] = FIXED_CLIENTS[i].port_id;
+        }
+    }
+}
+#endif /* CONFIG_CYPHAL_CLIENT */

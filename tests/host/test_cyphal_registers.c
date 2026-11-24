@@ -4,11 +4,11 @@
  * (its generated r2/holo/ports.h, copied unchanged into fixtures/: a real table of eleven ports of
  * every kind). `make -C tests/host`.
  */
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include "check.h"
 #include "cyphal_registers.h"
+#include "values.h"
 #include "r2/holo/ports.h"
 
 /* The firmware's table, as main/main.c builds it */
@@ -57,43 +57,6 @@ static void defaults(cyphal_settings_t *s)
 static int find(const char *name)
 {
     return cyphal_reg_find((const uint8_t *)name, strlen(name));
-}
-
-/* Values of each kind, as a tool would send them */
-static uavcan_register_Value_1_0 nat16(int n, ...)
-{
-    uavcan_register_Value_1_0 v;
-    memset(&v, 0, sizeof(v));
-    uavcan_register_Value_1_0_select_natural16_(&v);
-    va_list ap;
-    va_start(ap, n);
-    for (int i = 0; i < n; i++) {
-        v.natural16.value.elements[i] = (uint16_t)va_arg(ap, int);
-    }
-    va_end(ap);
-    v.natural16.value.count = (size_t)n;
-    return v;
-}
-
-static uavcan_register_Value_1_0 nat32(int n, uint32_t a, uint32_t b, uint32_t c)
-{
-    uavcan_register_Value_1_0 v;
-    memset(&v, 0, sizeof(v));
-    uavcan_register_Value_1_0_select_natural32_(&v);
-    const uint32_t e[3] = { a, b, c };
-    memcpy(v.natural32.value.elements, e, sizeof(e));
-    v.natural32.value.count = (size_t)n;
-    return v;
-}
-
-static uavcan_register_Value_1_0 str(const char *s, size_t len)
-{
-    uavcan_register_Value_1_0 v;
-    memset(&v, 0, sizeof(v));
-    uavcan_register_Value_1_0_select_string_(&v);
-    memcpy(v._string.value.elements, s, len);
-    v._string.value.count = len;
-    return v;
 }
 
 static bool is_nat16(const uavcan_register_Value_1_0 *v, size_t count, uint16_t a)

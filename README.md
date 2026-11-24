@@ -19,7 +19,7 @@ IDF component. Needs ESP-IDF 6.0 or later.
 | `holo` | `holo_start(holos, n, &cfg)`, `holo_register_command()`; `holo_motion()`, `holo_status()` | `holo`: `center` `move` `nudge` `twitch` `wag` `nod` `scan` `circle` `stop` `led` `leia` `off` `endpoints` |
 | `canbus` | `register_can_commands(&cfg)` (it calls `canbus_init()`); `canbus_init()` first from `app_main` for a protocol on top that uses `canbus_start()` and the rest of `canbus.h` without the command | `can`: `start` `stop` `send` `dump` `echo` `recover` |
 | `libcanard` | nothing: `cyphal` requires it | none: OpenCyphal's libcanard v4.0.0 (`third_party/libcanard`) packaged as a component |
-| `cyphal` | `cyphal_init(&app)`, `cyphal_register_commands(how_to_start)`, then `cyphal_start(tx, rx)` | `cyphal`: `id` `name` `bitrate` `restart` `reset` `register` (and `allocator` `allocations` with `CONFIG_CYPHAL_PNP_ALLOCATOR`) |
+| `cyphal` | `cyphal_init(&app)`, `cyphal_register_commands(how_to_start)`, then `cyphal_start(tx, rx)`; with `CONFIG_CYPHAL_CLIENT`, `cyphal_call()` and `cyphal_call_wait()` | `cyphal`: `id` `name` `bitrate` `restart` `reset` `register` (and `allocator` `allocations` with `CONFIG_CYPHAL_PNP_ALLOCATOR`) |
 
 Notes:
 
@@ -167,6 +167,10 @@ Notes:
   - With a single holo, `holo <verb>` works without naming it.
   - `holo_motion()` and `holo_status()` are the console's verbs and status for other callers
     (an HTTP API), with the same ranges and refusals.
+  - A twitch or a scan with a time limit (`-t`, `time_s`) holds where it is at that time, a
+    segment in flight or not. Until 2026-11-23 the limit was looked at only between segments,
+    and a scan, which starts its next leg the moment one ends, never ended.
+    `tests/host/test_holo.c` checks the end of each, built on the computer against stub headers.
 
 - `canbus` runs one TWAI (CAN) controller, classic frames only, on the ESP32-S3 or the ESP32-P4:
   frames in through a queue the ISR fills, out through a pool it empties, and the error state.
@@ -245,7 +249,8 @@ Notes:
       row into a heard one within a heartbeat or two, so its next ask gets a new node-ID: seen
       with a real holo on the dome panel, 2026-11-22). `cyphal reset` and a factory reset over
       Cyphal turn the setting off and empty the table.
-    - Keyed by pseudo-ID alone: the node makes no client calls, so no `GetInfo` follow-up.
+    - Keyed by pseudo-ID alone: the allocator makes no client calls (not even with the client
+      below built in), so no `GetInfo` follow-up.
     - What it costs, on the dome panel's ESP32-P4 (2026-11-22): 8.8 KB of code, 200 bytes of
       static internal RAM, the table in PSRAM; through 200 requests a second for a minute, no
       NVS write, heartbeats 0.99-1.01 s apart, libcanard's heap 2,100 bytes at most.
@@ -269,8 +274,104 @@ Notes:
       heartbeat. The port list names subject 8166 only while the allocator answers (not once
       it has yielded or been reset). A save queued before a reset does not write the erased
       table back.
-  - Host tests: `make -C tests/host` builds `cyphal_util.c`, `cyphal_registers.c` and
-    `cyphal_alloc.c` with the computer's `cc` and runs them (no ESP-IDF).
+  - **A client, optionally** (`CONFIG_CYPHAL_CLIENT`, off by default; `cyphal_client.h`). The
+    node calls services on other nodes:
+    - What it calls: the application's `CYPHAL_PORT_CLI` ports, whose service-IDs are registers
+      (`uavcan.cln.<name>.id` and `.type`) and whose handlers give the response's extent
+      (`cyphal_handler_t.extent`, `CYPHAL_CALL_RESPONSE_MAX` at most); and, with no port of the
+      application's, the standard services on their fixed IDs, `CYPHAL_CALL_FIXED(id)`:
+      `uavcan.node.GetInfo` (430), `ExecuteCommand` (435), `uavcan.register.Access` (384) and
+      `List` (385), `uavcan.file.GetInfo` (405) and `List` (406). All are rows of one table: the
+      application's are subscribed to (their responses) when the node goes online, a standard
+      one at its first call in a run, so a firmware that only calls GetInfo pays for one
+      subscription; each is listed among `port.List`'s clients once subscribed (a standard one's
+      first call sends the list again). The service-IDs it calls are a set of their own: a called
+      port may share an ID with a served one (the node serves GetInfo and calls it too), never
+      with another called one or a standard one it calls (`cyphal_reg_called()`). Without the
+      option a `CYPHAL_PORT_CLI` port is handled by the code as it was before the kind existed (the
+      objects must not change): its ID is checked as a subject's, and its handler as a
+      publication's, so it is refused and logged unless it sets `publish_max`, and then kept, never
+      subscribed, and listed among `port.List`'s subscribers. Put one in a table only with the
+      option.
+    - `cyphal_call(port, server, request, size, timeout_ms, cb, ctx)`, from any task, never
+      waits: the serialized request (`CYPHAL_CALL_REQUEST_MAX`, 515 bytes, at most) is copied
+      into one of `CONFIG_CYPHAL_CLIENT_CALLS` records (8, PSRAM) and the node's task sends it at
+      the port's priority (nominal for a standard service). The outcome goes to `cb` on the
+      node's worker, exactly once: `ESP_OK` with the response (cut to the extent),
+      `ESP_ERR_TIMEOUT`, `ESP_ERR_NO_MEM` (libcanard refused the request), or
+      `ESP_ERR_INVALID_STATE` (the node stopped, restarted or lost its node-ID first). Refused at
+      once, with no callback: `ESP_ERR_NOT_SUPPORTED` for a port it can't call (or off this run),
+      `ESP_ERR_INVALID_ARG` (a server over 127 or the node itself, a timeout of 0, a size with no
+      request), `ESP_ERR_INVALID_SIZE` (a request over 515 bytes), `ESP_ERR_INVALID_STATE` while
+      the node isn't online on a node-ID, `ESP_ERR_NOT_FINISHED` with every record in use (or
+      none, if they couldn't be allocated). The callback may run before `cyphal_call()` returns.
+    - Order, as `cyphal_publish()` keeps its messages': each call queued is stamped with a
+      sequence number, and the node's task queues requests for the bus oldest first (a task's
+      calls in the order it made them); a request the transmit queue has no room for yet holds
+      the younger ones behind it. libcanard's queue sends by CAN ID, so requests to one service on
+      one server leave in that order, and others (another priority, service or server) may pass
+      them. The worker runs the callbacks of the calls ended by its turn oldest call first; a call
+      that ends while an older one is still out has its callback first.
+    - A callback finds its call's record already free (the response is a copy in the worker's
+      scratch), so it can make the next call even with every other record in use: a chain of calls
+      needs one record, not one more than its length.
+    - `cyphal_call_wait(...)` is the same call, waiting for the outcome on the caller's task
+      (the response copied into its buffer, `*resp_size` the bytes copied: 0 on every failure but
+      `ESP_ERR_INVALID_SIZE`, which copies what fits). `ESP_ERR_NOT_ALLOWED`, nothing sent, from a
+      task the call would wait on: the node's task, its worker (the application's poll, its
+      services' work, a callback), or a task holding the node's lock, which the worker takes (the
+      allocator's rows, a register written over Cyphal): an application register's `write` hook,
+      run under that lock for the console's `cyphal register`.
+    - Only the node's task touches libcanard: it gives each request its transfer-ID (one counter
+      for each port and server, as Cyphal keeps one a session, kept across the node's restarts,
+      skipping a transfer-ID a call still awaiting its answer from that server on that service
+      holds, so no response can answer two calls), queues it when the transmit queue has room for
+      the whole of it (the mailboxes' rule) with its transfer's deadline the call's (a second at
+      most), so no frame of it is handed to the controller once the call has timed out (the one
+      already inside the controller may still go, on a bus that won't take it), matches each
+      response by service-ID, source and transfer-ID, copies it out of libcanard's buffer (freed
+      as every transfer's is) and times calls out. A response that matches no call (late, another
+      node's, a transfer-ID nobody waits for) is dropped and counted. The worker runs the
+      callbacks. The records not free are counted, so with no call out the node's task and the
+      worker pass the client by without a scan.
+    - A record's state word carries its generation (how many times it has been taken), and the
+      caller's cancel and the node task's begin each name the word they saw: a cancel late enough
+      to find its call failed by a stop, freed and the record taken by another call leaves that
+      call alone, and the node's task reads a record's fields only once its begin has them.
+    - `cyphal` prints its counters since boot (calls, answered, timed out, not sent, failed,
+      responses dropped: a stop's failed calls stay counted beside the calls they were, so calls
+      always add up), the records under way and the standard services called this run, only with
+      the option.
+    - Other nodes' heartbeats, for a client that needs to know a server restarted (its uptime
+      going back: nothing else a node sends carries one) or went quiet: `cyphal_app_t.on_heartbeat`
+      (a field only with the option), called on the node's task with the source and the heartbeat
+      (`cyphal_heartbeat_t`) for every one heard while online. They are read from the frame
+      alone (`cyphal_heartbeat_frame()`, host-tested), as the allocator reads another
+      allocator's answer: a heartbeat is one frame, so there is no subscription, no libcanard
+      memory and nothing kept for each node heard. With the hook set, `port.List` names 7509
+      among the subscribers, since the node does hear it. Only a heartbeat of one frame (the 1.0
+      type's 7 bytes) is heard: a later version that took more than one frame would not be. NULL
+      reads none.
+    - Known limit: a response later than the call's timeout that arrives after 32 more calls to
+      the same service on the same server (the 5-bit transfer-ID round again) would answer the call
+      then out on that transfer-ID. A server answering within its caller's timeout never meets it.
+    - What it costs, on the dome panel's ESP32-P4 (2026-11-22): about 4.2 KB of flash, 92 bytes
+      of static internal RAM, the rest PSRAM (about 1 KB a call record; the Kconfig help has the
+      sum).
+    - Without the option nothing of it is compiled: `cyphal_client.c` is left out, and the calls
+      into it from `cyphal.c`, `cyphal_registers.c` and `cmd_cyphal.c` are under `#if` or macros
+      that are nothing without it, so the objects' code and data are what they were but for
+      `ESP_ERROR_CHECK`'s `__LINE__` in `cyphal_register_commands()`, as with the allocator
+      (checked on holo-player-fw's build, byte for byte, and on the dome panel's with the
+      allocator on, where only the RISC-V assembler's local `.L` labels are numbered
+      differently).
+  - Host tests: `make -C tests/host` builds `cyphal_util.c`, `cyphal_registers.c`,
+    `cyphal_alloc.c` and `cyphal_client.c` with the computer's `cc` and runs them (no ESP-IDF),
+    and the `holo` engine's `test_holo.c` beside them;
+    the client's through libcanard, a client and servers handing frames between them. The first
+    three need only `cc`; in a checkout without the libcanard submodule the client's is skipped,
+    with a line saying so. They pass under `-fsanitize=address,undefined` too
+    (`make -C tests/host BUILD=build/san CC="cc -fsanitize=address,undefined"`).
   - Clone recursively: libcanard and the DSDL are submodules under `third_party/`, which IDF
     does not take for components (it has no `CMakeLists.txt`).
 

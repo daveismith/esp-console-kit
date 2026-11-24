@@ -202,4 +202,37 @@ menu "Cyphal node (cyphal)"
             `cyphal allocator` changes. A register name by the standard's rules: a-z, 0-9, _ and .,
             with at least one dot. A firmware sets its own in its sdkconfig.defaults.
 
+    config CYPHAL_CLIENT
+        bool "The node can call services on other nodes"
+        default n
+        help
+            Builds in a Cyphal client (cyphal_client.h): cyphal_call(), from any task, sends a request
+            and hands the response, or the timeout, to a callback on the node's worker;
+            cyphal_call_wait() waits for it. It calls the application's CYPHAL_PORT_CLI ports (their
+            service-IDs registers, uavcan.cln.<name>.id, listed among port.List's clients) and the
+            standard services on their fixed IDs with no port of the application's (GetInfo,
+            ExecuteCommand, register Access and List, file GetInfo and List), only while the node is
+            online on a node-ID. The kit's README ("cyphal") has the rules. Off, nothing of it is
+            compiled. Costs, on (measured on the dome panel's ESP32-P4, 2026-11-22): about 4.2 KB of
+            code and constants in flash; 92 bytes of static internal RAM with 8 calls (4 a call for its
+            state, 52 for the pool, 4 for the port registers' rule, 4 for the standard services
+            called); in PSRAM, about 1 KB a call
+            (CONFIG_CYPHAL_CLIENT_CALLS), 128 bytes of transfer-IDs for each port it can call (the
+            application's CYPHAL_PORT_CLI ports and the six standard services), and room for a
+            libcanard subscription (552 bytes) to each of the six, made at its first call in a run;
+            in libcanard's heap, a session for each server that answers and each response at its
+            extent while it is reassembled.
+
+    config CYPHAL_CLIENT_CALLS
+        int "Calls the client has out at once"
+        depends on CYPHAL_CLIENT
+        default 8
+        range 1 32
+        help
+            Records for calls queued, sent and awaiting their answer, or answered and awaiting
+            their worker's turn: one more call is refused (ESP_ERR_NOT_FINISHED) until one is free.
+            A record is free again before its callback runs, so a callback can always make the next
+            call of a chain. In PSRAM, about 1 KB each (the request's 515 bytes at most and the
+            response's 448), and 4 bytes each of internal RAM for its state.
+
 endmenu

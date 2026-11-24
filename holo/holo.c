@@ -440,7 +440,9 @@ static bool tick_holo(size_t i, int64_t now, bool armed)
         stop_motion(i, HOLO_WHY_NOT_ARMED, NULL);
         return led_animated(h);
     }
-    if (h->motion_until != 0 && now >= h->motion_until && !h->moving) {
+    /* A twitch's or a scan's time limit: it holds where it is from then, a segment in flight or not.
+     * Looked at only between segments, a scan never ended, since it starts its next the moment one ends */
+    if (h->motion_until != 0 && now >= h->motion_until) {
         stop_motion(i, NULL, NULL);
         return led_animated(h);
     }

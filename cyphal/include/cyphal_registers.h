@@ -11,7 +11,8 @@
  *                                        application's (CONFIG_CYPHAL_NAME_REGISTER: r2.node.name on the droid's boards)
  *   2  uavcan.can.bitrate  natural32[2]  the first 125000, 250000, 500000 or 1000000; the second
  *                                        (CAN FD's data phase) ignored, and read back as the first
- * then, for each of the application's ports in its table's order, its `uavcan.<kind>.<name>.id`
+ * then, for each of the application's ports in its table's order, its `uavcan.<kind>.<name>.id` (kind pub,
+ * sub, srv, or cln for a service it calls)
  * (natural16[1]: a subject-ID 0-8191 or a service-ID 0-511 that no other port has, by
  * cyphal_port_id_free()'s rule, or 65535 for off) and its
  * `uavcan.<kind>.<name>.type` (string, the port's type, immutable). All of these are persistent;
@@ -51,6 +52,12 @@ typedef enum {
     CYPHAL_PORT_PUB,    /* a subject the node publishes */
     CYPHAL_PORT_SUB,    /* a subject it subscribes to */
     CYPHAL_PORT_SRV,    /* a service it serves */
+    /* A service it calls (cyphal_client.h): only with CONFIG_CYPHAL_CLIENT. Without it nothing handles one, and the
+     * code is as it was before the kind existed (so that the library's objects don't change): its ID register checks
+     * its ID as a subject's (0-8191, in the subjects' set), and its handler is checked as a publication's, so it is
+     * refused and logged ("publish_max is 1 to CYPHAL_PUBLISH_MAX") unless it sets publish_max, and then kept, never
+     * subscribed, and listed among port.List's subscribers. Put one in a table only with the option */
+    CYPHAL_PORT_CLI,
 } cyphal_port_kind_t;
 
 /* One of the application's own ports: one whose ID is a register, with a default */
@@ -89,11 +96,17 @@ typedef struct {
  * defaults against them; the node gives them from its table of what it serves and publishes */
 void cyphal_reg_fixed(const cyphal_fixed_port_t *fixed, size_t count);
 
+/* With CONFIG_CYPHAL_CLIENT, also before cyphal_reg_init(): the standard services the node calls on their fixed IDs,
+ * as a test of a service-ID (kept): no CYPHAL_PORT_CLI port of the application's may have one. NULL for none */
+void cyphal_reg_called(bool (*fixed)(uint16_t id));
+
 /*
  * The rule for the ports' IDs. Subject-IDs (published and subscribed alike: a subscription on a subject
  * the node publishes would take other nodes' messages of that type for its own) are one set, service-IDs
- * another. Within each, an ID belongs to one port at most: one of the node's own (cyphal_reg_fixed()) or
- * one of the application's. CYPHAL_PORT_OFF is no ID, and any number of ports may be off.
+ * another, and with CONFIG_CYPHAL_CLIENT the service-IDs the node calls a third (its requests and its
+ * responses are transfers of different kinds, so it may call a service it also serves: GetInfo, say).
+ * Within each, an ID belongs to one port at most: one of the node's own (cyphal_reg_fixed(), and
+ * cyphal_reg_called() for the services it calls) or one of the application's. CYPHAL_PORT_OFF is no ID, and any number of ports may be off.
  *
  * Whether the application's port `index` may have `id` beside the other ports' IDs in s, only the first
  * `upto` of them looked at (index itself skipped). False, with why: "subject 2301 is
@@ -154,8 +167,10 @@ struct cyphal_register {
      * refusal with the reason in `why`, the register unchanged. A CYPHAL_REG_NEXT_START register writes
      * into `s`, which the caller saves; the application's get NULL, keep the value themselves and apply
      * it as they say. Runs on the node's worker task (a write over Cyphal) or the console's, so it may
-     * wait. NULL for a register nobody can write ("it can't be written"); an application's register has
-     * one exactly when it is CYPHAL_REG_MUTABLE */
+     * wait, but under the node's lock, which the worker takes too: never for the worker, so never in
+     * cyphal_call_wait() (CONFIG_CYPHAL_CLIENT), which refuses there (ESP_ERR_NOT_ALLOWED); cyphal_call()
+     * may be used. NULL for a register nobody can write ("it can't be written"); an application's register
+     * has one exactly when it is CYPHAL_REG_MUTABLE */
     cyphal_reg_result_t (*write)(const cyphal_register_t *r, cyphal_settings_t *s, const uavcan_register_Value_1_0 *v,
                                  char *why, size_t why_len);
     const void *ctx;                /* the register's own: a port, for the node's port registers */

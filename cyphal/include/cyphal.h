@@ -28,14 +28,22 @@
  * message the application publishes goes into the port's mailbox (cyphal_publish()), from any task, and the
  * node's task gives it its port, priority and transfer-ID. A mailbox of depth 1 keeps the newest, replacing
  * one not yet sent; a deeper one is a queue that never replaces. libcanard stays the node task's alone.
+ *
+ * With CONFIG_CYPHAL_CLIENT the node also calls services on other nodes (cyphal_client.h): the application's
+ * CYPHAL_PORT_CLI ports and the standard services on their fixed IDs, the response handed to a callback on the
+ * node's worker.
  */
 #pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "sdkconfig.h"
 #include "cyphal_registers.h"
 #include "cyphal_util.h"
+#if CONFIG_CYPHAL_CLIENT
+#include "cyphal_client.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -127,7 +135,8 @@ typedef struct {
 typedef struct {
     size_t port;                /* its index in cyphal_app_t.ports; its kind is the port's */
     /* CYPHAL_PORT_SRV and CYPHAL_PORT_SUB: the request's or the message's extent, which libcanard cuts a
-     * transfer to */
+     * transfer to. CYPHAL_PORT_CLI (CONFIG_CYPHAL_CLIENT): the response's, CYPHAL_CALL_RESPONSE_MAX at most, and
+     * nothing else of the handler's; the port is then called with cyphal_call() (cyphal_client.h) */
     size_t extent;
     /* CYPHAL_PORT_SRV. decode(), on the node's task: the request's payload deserialized into `in`, in_size
      * bytes (CYPHAL_APP_REQUEST_MAX at most) of a job slot, zeroed first, off any stack; false for a request
@@ -199,6 +208,15 @@ typedef struct {
      * milliseconds until it wants to run again; cyphal_wake_worker() runs it sooner, and so does the node going
      * online. It runs from the node's first start on, whether or not the node is online. NULL for none */
     uint32_t (*poll)(bool online);
+#if CONFIG_CYPHAL_CLIENT
+    /* Another node's uavcan.node.Heartbeat (cyphal_heartbeat_t, cyphal_client.h): every one heard while the node is
+     * online, read from its frame (cyphal_heartbeat_frame()), on the node's task, which it must not hold up: a copy,
+     * and cyphal_wake_worker() for the work. A client's way to tell that a server restarted (its uptime going back)
+     * or went quiet. Only a heartbeat of one frame is heard (the 1.0 type's 7 bytes; a later version taking more
+     * than one frame would not be). With the hook set, port.List names 7509 among the subscribers. NULL for none.
+     * The field exists only with CONFIG_CYPHAL_CLIENT */
+    void (*on_heartbeat)(uint8_t from, const cyphal_heartbeat_t *hb);
+#endif
 } cyphal_app_t;
 
 /* The saved settings, the register table and the lock. From app_main, once, before anything else

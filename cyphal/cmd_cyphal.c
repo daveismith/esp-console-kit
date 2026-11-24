@@ -19,6 +19,7 @@
 #define ALLOC_HINT ""
 #define ALLOC_HELP ""
 #endif
+#include "cyphal_client.h"      /* declarations only: used with CONFIG_CYPHAL_CLIENT */
 
 static const char *s_how_to_start;     /* the application's words for what turns the node on */
 
@@ -208,6 +209,17 @@ static void print_status(void)
                (unsigned long)m->published, (unsigned long)(m->depth > 1 ? m->refused : m->replaced),
                m->depth > 1 ? "refused, full" : "replaced", i + 1 < st.mail_count ? ", " : "\n");
     }
+#if CONFIG_CYPHAL_CLIENT
+    cyphal_client_status_t cl;      /* since boot, the calls made and how they ended; records held; the services */
+    cyphal_client_status(&cl);
+    printf("  client: since boot calls %lu, answered %lu, timed out %lu, not sent %lu, failed %lu, responses "
+           "dropped %lu; under way %u of %u; standard services called:", (unsigned long)cl.counts.made,
+           (unsigned long)cl.counts.answered, (unsigned long)cl.counts.timed_out, (unsigned long)cl.counts.not_sent,
+           (unsigned long)cl.counts.failed, (unsigned long)cl.counts.dropped, (unsigned)cl.held, (unsigned)cl.slots);
+    for (size_t i = 0; i <= cl.fixed_count; i++) {     /* each, then the line's end (" none" for none) */
+        i < cl.fixed_count ? printf(" %u", (unsigned)cl.fixed[i]) : printf(cl.fixed_count ? "\n" : " none\n");
+    }
+#endif
     printf("  worker: %lu of %lu job slots held; its stack %lu of %d bytes never used", (unsigned long)st.jobs_held,
            (unsigned long)st.job_slots, (unsigned long)st.worker_stack_unused, CONFIG_CYPHAL_WORKER_STACK);
     if (st.slow_worker) {
